@@ -1,0 +1,205 @@
+"""Tag dictionaries: aliases, quick categories, tag library.
+
+ALIASES keys are stored in canonical form (see filters.canonical); values are
+valid board tags.
+"""
+
+from __future__ import annotations
+
+from ..filters import canonical
+
+_RAW_ALIASES: dict[str, str] = {
+    "miku": "hatsune_miku",
+    "hatsune miku": "hatsune_miku",
+    "rem": "rem_(re:zero)",
+    "zero two": "zero_two_(darling_in_the_franxx)",
+    "2b": "2b_(nier:automata)",
+    "asuka": "soryu_asuka_langley",
+    "rei": "ayanami_rei",
+    "saber": "saber_(fate)",
+    "rin": "tohsaka_rin",
+    "aqua": "aqua_(konosuba)",
+    "megumin": "megumin",
+    "darkness": "darkness_(konosuba)",
+    "raphtalia": "raphtalia",
+    "mai": "sakurajima_mai",
+    "bunny girl": "bunny_girl",
+}
+
+ALIASES: dict[str, str] = {canonical(key): value for key, value in _RAW_ALIASES.items()}
+
+# Russian "kawaii" slang and category labels → board tags.
+_RAW_RU_SLANG: dict[str, str] = {
+    "ножки": "feet",
+    "ножка": "feet",
+    "ляшки": "thighs",
+    "ляшка": "thighs",
+    "сиси": "breasts",
+    "сиськи": "breasts",
+    "сисечки": "breasts",
+    "грудь": "breasts",
+    "сиська": "breasts",
+    "попка": "ass",
+    "жопка": "ass",
+    "задница": "ass",
+    "попа": "ass",
+    "животик": "belly",
+    "топ": "topless",
+    "топлесс": "topless",
+    "бельишко": "lingerie",
+    "бельё": "lingerie",
+    "белье": "lingerie",
+    "чулки": "stockings",
+    "колготки": "pantyhose",
+    "киска": "pussy",
+    "писечка": "pussy",
+    "спина": "back",
+    "спинка": "back",
+    "плечи": "shoulders",
+    "шея": "neck",
+    "губки": "lips",
+    "язычок": "tongue",
+    "зубки": "teeth",
+    "глазки": "eyes",
+    "волосы": "long_hair",
+    "хвостик": "ponytail",
+    "хвост": "tail",
+    "ушки": "animal_ears",
+    "кошачьи уши": "cat_ears",
+    "лисьи уши": "fox_ears",
+    "горничная": "maid",
+    "школьница": "school_uniform",
+    "купальник": "swimsuit",
+    "бикини": "bikini",
+    "свитер": "sweater",
+    "платье": "dress",
+    "юбка": "skirt",
+    "бондаж": "bondage",
+    "латекс": "latex",
+    "гипноз": "hypnosis",
+    "ахэгао": "ahegao",
+    "яндере": "yandere",
+    "цундере": "tsundere",
+    "моэ": "moe",
+    "эротика": "erotic",
+    "ню": "nude",
+    "голая": "nude",
+    "обнажёнка": "nude",
+    "большая грудь": "huge_breasts",
+    "большие сиськи": "large_breasts",
+    "плотные ляшки": "thick_thighs",
+    "потешки": "suggestive",
+}
+
+RU_SLANG: dict[str, str] = {canonical(key): value for key, value in _RAW_RU_SLANG.items()}
+
+FETISHES: dict[str, str] = {
+    "👠 Feet": "feet",
+    "🎀 Stockings": "stockings",
+    "👙 Lingerie": "lingerie",
+    "🔗 Bondage": "bondage",
+    "💎 Latex": "latex",
+    "✨ Hypnosis": "hypnosis",
+    "🍑 Huge Breasts": "huge_breasts",
+    "🌸 Anime Girls": "anime_girls",
+    "😈 Succubi": "succubus",
+    "🦊 Kemonomimi": "animal_ears",
+    "👗 Maids": "maid",
+    "🎓 School Uniform": "school_uniform",
+    "💕 Ahegao": "ahegao",
+    "🌊 Swimsuits": "swimsuit",
+}
+
+TAG_LIBRARY: dict[str, dict[str, str]] = {
+    "🎭 Popular Characters": {
+        "Hatsune Miku": "hatsune_miku",
+        "Rem (Re:Zero)": "rem_(re:zero)",
+        "Zero Two": "zero_two_(darling_in_the_franxx)",
+        "2B (Nier)": "2b_(nier:automata)",
+        "Asuka": "soryu_asuka_langley",
+        "Rei Ayanami": "ayanami_rei",
+        "Saber": "saber_(fate)",
+        "Rin Tohsaka": "tohsaka_rin",
+        "Aqua": "aqua_(konosuba)",
+        "Megumin": "megumin",
+        "Darkness": "darkness_(konosuba)",
+        "Raphtalia": "raphtalia",
+        "Mai Sakurajima": "sakurajima_mai",
+        "Kurisu Makise": "makise_kurisu",
+        "Mikasa Ackerman": "mikasa_ackerman",
+    },
+    "👙 Clothing": {
+        "Stockings": "stockings",
+        "Lingerie": "lingerie",
+        "Swimsuit": "swimsuit",
+        "Bikini": "bikini",
+        "Maid": "maid",
+        "School Uniform": "school_uniform",
+        "Bunny Girl": "bunny_girl",
+        "Kimono": "kimono",
+        "Sweater": "sweater",
+        "Pantyhose": "pantyhose",
+        "Fishnet": "fishnet",
+        "Dress": "dress",
+    },
+    "💕 Fetishes": {
+        "Feet": "feet",
+        "Bondage": "bondage",
+        "Latex": "latex",
+        "Hypnosis": "hypnosis",
+        "Huge Breasts": "huge_breasts",
+        "Ahegao": "ahegao",
+        "Yandere": "yandere",
+        "Tsundere": "tsundere",
+        "Cat Ears": "cat_ears",
+        "Fox Ears": "fox_ears",
+    },
+    "🔥 18+ Content": {
+        "Underwear": "underwear",
+        "Topless": "topless",
+        "Erotic": "erotic",
+        "Suggestive": "suggestive",
+        "Large Breasts": "large_breasts",
+        "Thick": "thick_thighs",
+        "Nude": "nude",
+        "BDSM": "bdsm",
+    },
+    "🎨 Styles": {
+        "Anime": "anime",
+        "Manga": "manga",
+        "3D": "3d",
+        "Pixel Art": "pixel_art",
+        "Artbook": "artbook",
+        "Realistic": "realistic",
+    },
+    "🌟 Anime Characters": {
+        "Hinata Hyuga": "hyuuga_hinata",
+        "Tsunade": "tsunade",
+        "Sakura": "haruno_sakura",
+        "Nami": "nami_(one_piece)",
+        "Nico Robin": "nico_robin",
+        "Bulma": "bulma",
+        "Android 18": "android_18",
+        "C.C.": "c.c.",
+        "Rias Gremory": "rias_gremory",
+        "Akeno": "himejima_akeno",
+    },
+    "🎮 Game Characters": {
+        "Tifa Lockhart": "tifa_lockhart",
+        "Aerith": "aerith_gainsborough",
+        "Lara Croft": "lara_croft",
+        "Jill Valentine": "jill_valentine",
+        "Ada Wong": "ada_wong",
+        "Widowmaker": "widowmaker_(overwatch)",
+        "D.Va": "d.va_(overwatch)",
+        "Mercy": "mercy_(overwatch)",
+        "Bayonetta": "bayonetta",
+    },
+}
+
+# Menu labels double as search slang, so users can type them directly.
+for _label, _tag in FETISHES.items():
+    RU_SLANG.setdefault(canonical(_label), _tag)
+for _group in TAG_LIBRARY.values():
+    for _label, _tag in _group.items():
+        RU_SLANG.setdefault(canonical(_label), _tag)
