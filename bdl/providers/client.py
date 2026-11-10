@@ -6,12 +6,12 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import aiohttp
 
-from .. import USER_AGENT
+from .. import USER_AGENT, XBOORU_USER_AGENT
 from ..models import Post
 from ..net.doh import DoHResolver
 from .base import Provider, ProviderError
@@ -53,6 +53,17 @@ class ProviderClient:
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
             proxy=self._settings.proxy or None,
         )
+
+    @staticmethod
+    def _headers_for(provider: Provider) -> dict[str, str]:
+        """Per-board request headers.
+
+        Xbooru sits behind Cloudflare, which is quicker to challenge a client
+        that announces itself as a script than one that looks like a browser.
+        """
+        if provider.key == "xbooru":
+            return {"User-Agent": XBOORU_USER_AGENT}
+        return {}
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -96,17 +107,49 @@ class ProviderClient:
         provider = PROVIDERS.get(provider_key)
         if provider is None:
             raise ProviderError(f"Unknown source: {provider_key}")
+        return await self.search_provider(provider, provider_key, tags, page, limit, order)
 
+    async def search_provider(
+        self,
+        provider: Provider,
+        provider_key: str,
+        tags: str,
+        page: int,
+        limit: int,
+        order: str = "",
+    ) -> ProviderResult:
+        """One board query, including the weekly-top fallback.
+
+        Shared by both client classes on purpose: the fallback was once written
+        directly into ``search`` and silently lost, because ``CliProviderClient``
+        overrides that method and never called it.
+        """
         cache_key = (provider_key, tags, page, limit, order)
         cached = self._cache_get(cache_key)
         if cached is not None:
             LOG.debug("cache hit %s: %s p%s", provider_key, tags, page)
             return cached
 
-        url = provider.build_url(tags, page, limit, self._settings.credentials_for(provider_key), order)
+        creds = self._settings.credentials_for(provider_key)
+        url = provider.build_url(tags, page, limit, creds, order)
         payload = await self._fetch_json(url, provider)
         raw_items = provider.raw_items(payload)
         posts = tuple(provider.parse(payload))
+        if page == 1 and order == "top" and provider.date_filter and not posts:
+            # Moebooru answers a rolling-week query with nothing when the tag
+            # saw no uploads in those seven days, which reads as "no results"
+            # rather than "nothing this week". Ask again over all time, keeping
+            # the score ordering.
+            fallback = replace(provider, date_filter=False)
+            LOG.info(
+                "%s: nothing in the last 7 days for %r; searching all time by score instead",
+                provider.title,
+                tags,
+            )
+            url = fallback.build_url(tags, page, limit, creds, order)
+            payload = await self._fetch_json(url, fallback)
+            raw_items = fallback.raw_items(payload)
+            posts = tuple(fallback.parse(payload))
         result = ProviderResult(
             provider=provider_key,
             posts=posts,
@@ -125,7 +168,7 @@ class ProviderClient:
             try:
                 async with self._semaphore:
                     assert self._session is not None
-                    async with self._session.get(url) as response:
+                    async with self._session.get(url, headers=self._headers_for(provider)) as response:
                         if response.status == 429:
                             # Sleep after leaving the semaphore, otherwise one
                             # source's 429 holds up every other source.
@@ -134,10 +177,7 @@ class ProviderClient:
                         elif response.status >= 500:
                             raise _RetryableError(f"HTTP {response.status}")
                         elif response.status in (401, 403):
-                            raise ProviderError(
-                                f"{provider.title}: authorization required (HTTP {response.status}). "
-                                f"Add {provider.key.upper()}_API_KEY to .env."
-                            )
+                            raise ProviderError(_denied_message(provider, response.status))
                         elif response.status >= 400:
                             raise ProviderError(
                                 f"{provider.title}: response error HTTP {response.status}. Check the API keys."
@@ -175,6 +215,21 @@ class ProviderClient:
 
 class _RetryableError(RuntimeError):
     pass
+
+
+def _denied_message(provider: Provider, status: int) -> str:
+    """Explain a 401/403 honestly, instead of blaming a missing API key.
+
+    A handful of boards need no key at all (xbooru, safebooru, tbib, e621), so
+    telling the user to add one sends them looking for a setting that does not
+    exist. What these boards do have is a bot filter.
+    """
+    if provider.key_required or provider.auth_style in ("user_id", "login"):
+        return f"{provider.title}: authorization required (HTTP {status}). Add {provider.key.upper()}_API_KEY to .env."
+    return (
+        f"{provider.title}: request rejected (HTTP {status}) by the board's bot filter. "
+        "Try again later or set PROXY_URL in .env."
+    )
 
 
 def _backoff(attempt: int) -> float:

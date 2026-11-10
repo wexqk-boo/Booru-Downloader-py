@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS downloads (
     score        INTEGER,
     file_url     TEXT NOT NULL,
     sha256       TEXT,
+    phash        TEXT,
     downloaded_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_downloads_source ON downloads(source);
@@ -95,7 +96,25 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an existing library untouched, so
+        a new column has to be added by hand or the insert statements break.
+        """
+        cursor = await self._conn.execute("PRAGMA table_info(downloads)")
+        try:
+            columns = {row[1] for row in await cursor.fetchall()}
+        finally:
+            await cursor.close()
+        if "phash" not in columns:
+            await self._conn.execute("ALTER TABLE downloads ADD COLUMN phash TEXT")
+        # Outside the branch: the schema above no longer creates this index,
+        # because it would run before the column exists on an older library.
+        await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_phash ON downloads(phash)")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -153,6 +172,17 @@ class Database:
             )
         return bool(rows)
 
+    async def all_phashes(self) -> list[tuple[str, str]]:
+        """``(uid, phash)`` for every recorded image.
+
+        Deliberately not scoped to one board: the same artwork is reposted
+        across boards under different ids, which is exactly the case the
+        perceptual check exists for.
+        """
+        return [
+            (row[0], row[1]) for row in await self._fetchall("SELECT uid, phash FROM downloads WHERE phash IS NOT NULL")
+        ]
+
     async def record_download(
         self,
         post: Post,
@@ -160,17 +190,18 @@ class Database:
         file_size: int | None,
         ext: str,
         sha256: str | None,
+        phash: str | None = None,
     ) -> None:
         await self.conn.execute(
             """
             INSERT INTO downloads (uid, source, post_id, file_path, file_size, ext,
-                                   tags, rating, width, height, score, file_url, sha256, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   tags, rating, width, height, score, file_url, sha256, phash, downloaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(uid) DO UPDATE SET
                 file_path = excluded.file_path, file_size = excluded.file_size,
                 ext = excluded.ext, tags = excluded.tags, rating = excluded.rating,
                 width = excluded.width, height = excluded.height, score = excluded.score,
-                file_url = excluded.file_url, sha256 = excluded.sha256,
+                file_url = excluded.file_url, sha256 = excluded.sha256, phash = excluded.phash,
                 downloaded_at = excluded.downloaded_at
             """,
             (
@@ -187,6 +218,7 @@ class Database:
                 post.score,
                 post.file_url,
                 sha256,
+                phash,
                 time.time(),
             ),
         )
@@ -199,13 +231,13 @@ class Database:
         await self.conn.executemany(
             """
             INSERT INTO downloads (uid, source, post_id, file_path, file_size, ext,
-                                   tags, rating, width, height, score, file_url, sha256, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   tags, rating, width, height, score, file_url, sha256, phash, downloaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(uid) DO UPDATE SET
                 file_path = excluded.file_path, file_size = excluded.file_size,
                 ext = excluded.ext, tags = excluded.tags, rating = excluded.rating,
                 width = excluded.width, height = excluded.height, score = excluded.score,
-                file_url = excluded.file_url, sha256 = excluded.sha256,
+                file_url = excluded.file_url, sha256 = excluded.sha256, phash = excluded.phash,
                 downloaded_at = excluded.downloaded_at
             """,
             rows,

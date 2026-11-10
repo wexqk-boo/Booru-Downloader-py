@@ -7,9 +7,11 @@ Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
 
 - **Async streaming downloads** — `asyncio` + `aiohttp`, files streamed to disk
   in chunks, concurrency bounded by `asyncio.Semaphore`.
-- **Three-level deduplication** — `uid` in SQLite, the file already present on
-  disk, and an optional sha256 check. Already-known posts are skipped without a
-  single media request.
+- **Four-level deduplication** — `uid` in SQLite, the file already present on
+  disk, an optional sha256 check, and a perceptual pHash so the same artwork
+  reposted to another board under a new id is skipped too. The first three
+  levels are free; the pHash has to see the bytes, so a repost is downloaded,
+  recognised and then deleted instead of being kept.
 - **Aspect-ratio filtering** — `--wallpapers`, `--avatars`, or a custom
   `--aspect-ratio MIN:MAX`, applied after the API response so nothing extra is
   downloaded. Boards that omit image dimensions are kept by default; pass
@@ -18,6 +20,12 @@ Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
   `~/.config/bdl/blacklist.txt`, plus a per-run `--blacklist` override.
 - **DNS-over-HTTPS and proxy support** — a built-in `DoHResolver` (Cloudflare)
   works around local DNS blocks on image CDNs, and an upstream proxy can be set.
+- **uvloop when available** — the event loop switches to uvloop on every
+  platform but Windows, which speeds up a batch of many small transfers.
+- **Typo tolerance** — a tag that is not in the dictionary is matched against
+  the popular tags and corrected before the query goes out (`mku` → `miku`).
+- **Image previews** — inside Kitty, finished pictures are drawn as thumbnails
+  once the batch ends; `--no-preview` turns them off.
 - **Interactive wizard** — `bdl` on a terminal (or `bdl tui`) walks through the
   download: boards with checkboxes, tags with live tag suggestions, limit, sort
   order, rating, geometry and an optional list of tags to exclude, then prints a
@@ -53,8 +61,9 @@ fish function named `bdl`, it shadows the binary — remove it
 (`rm ~/.config/fish/functions/bdl.fish`) and run `functions -e bdl` once;
 `./install.sh --remove` cleans that up together with the stale helper.
 
-Optional extras: `pip install -e '.[fast]'` pulls in `rapidfuzz` for faster tag
-suggestions (falls back to the standard-library `difflib` without it).
+`rapidfuzz` powers tag suggestions and typo correction; without it the code
+falls back to the standard-library `difflib`. `imagehash` and `pillow` enable
+perceptual dedup, and `uvloop` speeds up the event loop everywhere but Windows.
 
 ## Usage
 
@@ -112,7 +121,7 @@ confirmation.
 Common flags for `dl` / `sync`: `--limit`, `--per-page`, `--out`,
 `--concurrency`, `--sidecar`, `--checksum`, `--force`, `--min-score`,
 `--rating-include`, `--max-size-mb`, `--blacklist`, `--no-progress`,
-`--no-notify`, `--timeout`.
+`--no-preview`, `--no-notify`, `--timeout`.
 
 ## Directory layout
 

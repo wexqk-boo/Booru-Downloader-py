@@ -161,9 +161,7 @@ def normalize_tags(query: str) -> str:
         tokens = [_translate(token) for token in tokens]
 
     if leftover := [token for token in tokens if _CYRILLIC_RE.search(token.lstrip("-"))]:
-        raise QueryRejected(
-            f"Boards are indexed in Latin script; could not translate {leftover[0]!r}"
-        )
+        raise QueryRejected(f"Boards are indexed in Latin script; could not translate {leftover[0]!r}")
     for token in tokens:
         if not _ALLOWED_TAG_RE.match(token):
             raise QueryRejected(f"Invalid tag: {token!r}")

@@ -240,23 +240,7 @@ class CliProviderClient(ProviderClient):
         provider = self._providers.get(provider_key)
         if provider is None:
             raise ProviderError(f"Unknown source: {provider_key}")
-
-        cache_key = (provider_key, tags, page, limit, order)
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached
-
-        url = provider.build_url(tags, page, limit, self._settings.credentials_for(provider_key), order)
-        payload = await self._fetch_json(url, provider)
-        raw_items = provider.raw_items(payload)
-        posts = tuple(provider.parse(payload))
-        result = ProviderResult(
-            provider=provider_key,
-            posts=posts,
-            exhausted=len(raw_items) < limit,
-        )
-        self._cache_put(cache_key, result)
-        return result
+        return await self.search_provider(provider, provider_key, tags, page, limit, order)
 
 
 __all__ = ["ALL", "PROVIDERS", "TBIB", "CliProviderClient", "E621Provider", "resolve_sources"]

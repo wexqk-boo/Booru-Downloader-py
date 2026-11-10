@@ -153,6 +153,11 @@ def _add_batch_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--no-progress", action="store_true", help="disable the progress display")
     parser.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="do not draw image previews (they appear automatically inside Kitty)",
+    )
+    parser.add_argument(
         "--no-proxy-media",
         action="store_true",
         help="download media directly, bypassing the proxy (search still proxies)",
@@ -163,6 +168,21 @@ def _add_batch_args(parser: argparse.ArgumentParser) -> None:
 def _prog_name() -> str:
     raw = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
     return raw if raw in {"bdl", "booru-dl"} else "bdl"
+
+
+def _install_uvloop() -> None:
+    """Swap in uvloop when it is available.
+
+    It is a big win on a batch of many small transfers, but it is optional —
+    a missing wheel (or Windows) must not stop the CLI from starting.
+    """
+    try:
+        import uvloop
+    except ImportError:
+        LOG.debug("uvloop is not installed; keeping the default event loop")
+        return
+    uvloop.install()
+    LOG.debug("event loop: uvloop")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -204,9 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--once", action="store_true", help="run a single pass and exit")
     sp.set_defaults(func=cmd_sync)
 
-    sp = sub.add_parser(
-        "status", parents=[_common_parser()], help="download statistics", conflict_handler="resolve"
-    )
+    sp = sub.add_parser("status", parents=[_common_parser()], help="download statistics", conflict_handler="resolve")
     sp.add_argument("--json", action="store_true", help="machine readable output")
     sp.set_defaults(func=cmd_status)
 
@@ -232,9 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true", help="machine readable output")
     sp.set_defaults(func=cmd_prune_stale)
 
-    sp = sub.add_parser(
-        "config", parents=[_common_parser()], help="CLI settings", conflict_handler="resolve"
-    )
+    sp = sub.add_parser("config", parents=[_common_parser()], help="CLI settings", conflict_handler="resolve")
     sp.add_argument("action", choices=["get", "set", "show"], help="get <key> / set <key> <value> / show")
     sp.add_argument("key", nargs="?", default=None, help="setting name (e.g. out)")
     sp.add_argument("value", nargs="?", default=None, help="value for set")
@@ -299,6 +315,8 @@ def _print_summary(all_stats: dict[str, BatchStats]) -> None:
             f"  {_label(key)}: found={stats.found}, downloaded={stats.downloaded}, "
             f"skipped={stats.skipped}, filtered={stats.filtered}, failed={stats.failed}"
         )
+        if stats.duplicates:
+            print(f"      {stats.duplicates} of the skipped posts were reposts of art already in the library")
         if stats.unknown_aspect:
             print(f"      kept {stats.unknown_aspect} without board dimensions")
         if stats.reported == 0:
@@ -386,12 +404,21 @@ def check_batch_args(args: argparse.Namespace) -> str | None:
     return None
 
 
-async def _execute_batch(
-    args: argparse.Namespace, db: Database
-) -> tuple[dict[str, BatchStats], bool, list[str]]:
+async def _fixed_tags(tags: str) -> str:
+    """Nudge likely typos towards real tags before the boards are queried."""
+    from .tags.suggest import correct_typos
+
+    fixed, changes = await asyncio.to_thread(correct_typos, tags)
+    for typed, replacement in changes:
+        LOG.info("tag %r is not in the dictionary; searching %r instead", typed, replacement)
+    return fixed
+
+
+async def _execute_batch(args: argparse.Namespace, db: Database) -> tuple[dict[str, BatchStats], bool, list[str]]:
     creds = load_credentials(args.env_file)
     proxy = load_proxy(args.env_file)
     providers = resolve_sources(args.source)
+    args.tags = await _fixed_tags(args.tags)
     # The boards cannot filter by geometry, so width/height are checked locally.
     aspect_range = resolve_aspect_range(args)
     rating_set = resolve_rating_set(args)
@@ -434,6 +461,7 @@ async def _execute_batch(
             aspect_range=aspect_range,
             aspect_unknown=args.aspect_unknown,
             progress=not args.no_progress,
+            preview=not args.no_preview,
         ) as downloader,
     ):
         for provider in providers:
@@ -464,11 +492,14 @@ async def _execute_batch(
                 failed=stats.failed,
             )
             all_stats[provider.key] = stats
+        # After every board is done, so the gallery never fights the live bar.
+        downloader.show_previews()
     return all_stats, all_sources_failed, failed_providers
 
 
 async def cmd_search(args: argparse.Namespace) -> int:
     shim = ClientSettingsShim(credentials=load_credentials(args.env_file), proxy=load_proxy(args.env_file))
+    args.tags = await _fixed_tags(args.tags)
     found: list[tuple[str, Post]] = []
     async with CliProviderClient(shim, max_concurrency=4) as client:
         for provider in resolve_sources(args.source):
@@ -741,9 +772,7 @@ async def cmd_tags(args: argparse.Namespace) -> int:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30), proxy=load_proxy(args.env_file) or None
             ) as session:
-                site_tags = await fetch_site_tags(
-                    args.source, session, args.prefix, creds.for_url() if creds else None
-                )
+                site_tags = await fetch_site_tags(args.source, session, args.prefix, creds.for_url() if creds else None)
             if site_tags:
                 seen = set(hints)
                 for tag in site_tags:
@@ -798,6 +827,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if problem:
         print(f"{_prog_name()}: error: {problem}", file=sys.stderr)
         return 2
+    _install_uvloop()
     try:
         return asyncio.run(args.func(args))
     except KeyboardInterrupt:

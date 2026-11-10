@@ -185,7 +185,7 @@ async def _ask_tags(q: ModuleType, defaults: dict[str, Any]) -> str | None:
     """Free-form search tags; an empty string is allowed."""
     from prompt_toolkit.shortcuts import CompleteStyle
 
-    return await q.text(
+    answer = await q.text(
         t("tui.tags"),
         default=str(defaults.get("tags") or ""),
         instruction=t("tui.tags_hint"),
@@ -193,6 +193,19 @@ async def _ask_tags(q: ModuleType, defaults: dict[str, Any]) -> str | None:
         completer=_tag_completer(),
         complete_style=CompleteStyle.MULTI_COLUMN,
     ).ask_async()
+    if answer:
+        answer = _fix_typos(answer)
+    return answer
+
+
+def _fix_typos(tags: str) -> str:
+    """Correct obvious typos before the query goes out, and say so."""
+    from ..tags.suggest import correct_typos
+
+    fixed, changes = correct_typos(tags)
+    for typed, replacement in changes:
+        style.note(t("tui.tags_fixed", typed=typed, tag=replacement))
+    return fixed
 
 
 async def _ask_limit(q: ModuleType, defaults: dict[str, Any]) -> int | None:

@@ -1,5 +1,9 @@
 aiohttp>=3.10,<4
 aiofiles>=24.1
 aiosqlite>=0.20
+imagehash>=4.3
+pillow>=10
+rapidfuzz>=3
 rich>=13
 questionary>=2.0
+uvloop>=0.21; sys_platform != 'win32'

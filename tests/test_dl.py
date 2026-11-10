@@ -145,7 +145,7 @@ def test_danbooru_build_url() -> None:
     provider = PROVIDERS["danbooru"]
     url = provider.build_url("miku", 1, 100, {})
     assert url == "https://danbooru.donmai.us/posts.json?tags=miku&limit=100&page=1"
-    assert provider.build_url("miku", 2, 20, {}) .endswith("page=2")
+    assert provider.build_url("miku", 2, 20, {}).endswith("page=2")
     assert "search%5Border%5D=score" in provider.build_url("miku", 1, 100, {}, order="top")
 
 
@@ -591,6 +591,8 @@ def test_prune_stale_respects_scope(tmp_path) -> None:
             await db.close()
 
     asyncio.run(scenario())
+
+
 def test_collect_posts_stops_at_limit() -> None:
     class FakeClient:
         def __init__(self, all_posts: list[Post]) -> None:
@@ -980,3 +982,236 @@ def test_db_sha256_helpers(tmp_path) -> None:
             await db.close()
 
     asyncio.run(scenario())
+
+
+# Typo correction (rapidfuzz) and perceptual dedup
+def test_correct_typos_fixes_a_misspelled_tag() -> None:
+    from bdl.tags.suggest import correct_typos
+
+    fixed, changes = correct_typos("mku")
+    assert fixed == "miku"
+    assert changes == [("mku", "miku")]
+
+
+def test_correct_typos_leaves_real_tags_alone() -> None:
+    from bdl.tags.suggest import correct_typos
+
+    # Both are genuine tags, so they must survive untouched: "sakura" is a tag
+    # in its own right and "1girl" is shorthand, not a typo for "1girls".
+    assert correct_typos("miku sakura 1girl") == ("miku sakura 1girl", [])
+    assert correct_typos("") == ("", [])
+
+
+def test_correct_typos_keeps_a_negated_tag_negated() -> None:
+    from bdl.tags.suggest import correct_typos
+
+    fixed, changes = correct_typos("-mku")
+    assert fixed == "-miku"
+    assert changes == [("mku", "miku")]
+
+
+def test_perceptual_distance_and_duplicate_threshold() -> None:
+    from bdl.perceptual import DUPLICATE_DISTANCE, distance, is_duplicate
+
+    assert distance("0000000000000000", "0000000000000000") == 0
+    assert distance("0000000000000000", "000000000000000f") == 4
+    assert distance("ffffffffffffffff", "fffffffffffffff0") == 4
+    # A handful of flipped bits is a re-encode, not a different picture.
+    assert is_duplicate("0000000000000000", "000000000000000f")
+    # Half the bits flipped is a different picture.
+    assert not is_duplicate("0000000000000000", "00000000ffffffff")
+    assert distance("not-hex", "0000000000000000") is None
+    assert DUPLICATE_DISTANCE == 8
+
+
+def test_phash_of_file_survives_a_resize(tmp_path) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    from bdl.perceptual import is_duplicate, phash_of_file
+
+    original = tmp_path / "a.png"
+    Image.new("RGB", (96, 96), (200, 30, 90)).save(original)
+    resized = tmp_path / "b.png"
+    Image.open(original).resize((24, 24)).save(resized)
+
+    first = phash_of_file(original)
+    second = phash_of_file(resized)
+    assert first is not None and second is not None
+    assert is_duplicate(first, second)
+
+
+def test_phash_of_a_broken_file_is_none(tmp_path) -> None:
+    from bdl.perceptual import phash_of_file
+
+    broken = tmp_path / "broken.png"
+    broken.write_bytes(b"this is not an image")
+    # Dedup is an optimisation: an undecodable file must not raise.
+    assert phash_of_file(broken) is None
+
+
+def test_db_records_and_lists_phashes(tmp_path) -> None:
+    async def scenario() -> None:
+        db = Database(tmp_path / "ph.sqlite3")
+        await db.open()
+        try:
+            post = Post(id="1", source="x", file_url="https://x/1.png")
+            await db.record_download(post, "/tmp/1.png", 10, ".png", "hash", "abcdef0123456789")
+            assert await db.all_phashes() == [(post.uid, "abcdef0123456789")]
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_db_migrates_an_old_table_without_phash(tmp_path) -> None:
+    import sqlite3
+
+    async def scenario() -> None:
+        path = tmp_path / "old.sqlite3"
+        # A library written before perceptual dedup existed: no phash column.
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE downloads (uid TEXT PRIMARY KEY, source TEXT, post_id TEXT, file_path TEXT,"
+            " file_size INTEGER, ext TEXT, tags TEXT, rating TEXT, width INTEGER, height INTEGER,"
+            " score INTEGER, file_url TEXT, sha256 TEXT, downloaded_at REAL)"
+        )
+        conn.execute("INSERT INTO downloads VALUES ('x:1','x','1','/tmp/1.png',10,'.png','[]','safe',1,1,0,'u',NULL,0)")
+        conn.commit()
+        conn.close()
+
+        db = Database(path)
+        await db.open()
+        try:
+            # The migration adds the column; the old row's phash stays NULL and
+            # is simply not offered as dedup evidence.
+            assert await db.all_phashes() == []
+            post = Post(id="2", source="x", file_url="https://x/2.png")
+            await db.record_download(post, "/tmp/2.png", 10, ".png", None, "ffff000000000000")
+            assert (post.uid, "ffff000000000000") in await db.all_phashes()
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_repost_from_another_board_is_a_duplicate(tmp_path) -> None:
+    """The same picture under a different uid is caught by its pHash."""
+
+    async def scenario() -> None:
+        db = Database(tmp_path / "dup.sqlite3")
+        await db.open()
+        try:
+            first = Post(id="1", source="gelbooru", file_url="https://g/1.png")
+            await db.record_download(first, "/tmp/1.png", 10, ".png", None, "abcdef0123456789")
+            downloader = Downloader(db, out_root=tmp_path)
+            await downloader._load_phashes()
+
+            # Same art, reposted to another board under a new id: no uid match,
+            # no sha256 (not checked), but the perceptual hash agrees.
+            assert downloader._is_duplicate_picture("abcdef0123456789")
+            assert downloader._is_duplicate_picture("abcdef012345678f")  # 4 bits differ
+            assert not downloader._is_duplicate_picture("0000000000000000")
+            # The post's own earlier row never blocks it: --force exists to
+            # re-fetch a picture the user already has.
+            assert not downloader._is_duplicate_picture("abcdef0123456789", first.uid)
+            # A different post with the same art is still a repost.
+            assert downloader._is_duplicate_picture("abcdef0123456789", "gelbooru:2")
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_dedup_can_be_switched_off(tmp_path) -> None:
+    async def scenario() -> None:
+        db = Database(tmp_path / "nodup.sqlite3")
+        await db.open()
+        try:
+            post = Post(id="1", source="x", file_url="https://x/1.png")
+            await db.record_download(post, "/tmp/1.png", 10, ".png", None, "abcdef0123456789")
+            downloader = Downloader(db, out_root=tmp_path, dedup=False)
+            await downloader._load_phashes()
+            assert not downloader._is_duplicate_picture("abcdef0123456789")
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_xbooru_gets_a_browser_user_agent() -> None:
+    from bdl import XBOORU_USER_AGENT
+    from bdl.providers.client import ProviderClient
+
+    headers = ProviderClient._headers_for(PROVIDERS["xbooru"])
+    assert headers["User-Agent"] == XBOORU_USER_AGENT
+    assert "Firefox" in headers["User-Agent"]
+    # Other boards keep the honest tool agent.
+    assert ProviderClient._headers_for(PROVIDERS["gelbooru"]) == {}
+
+
+def test_rejection_message_does_not_invent_an_api_key() -> None:
+    from bdl.providers.client import _denied_message
+
+    # Xbooru has no API keys at all, so its 403 must not mention one.
+    plain = _denied_message(PROVIDERS["xbooru"], 403)
+    assert "API_KEY" not in plain
+    assert "bot filter" in plain
+    # Gelbooru does take a key, so there the hint is right.
+    keyed = _denied_message(PROVIDERS["gelbooru"], 401)
+    assert "GELBOORU_API_KEY" in keyed
+
+
+def test_preview_detection_uses_the_kitty_environment() -> None:
+    from bdl.preview import in_kitty
+
+    assert in_kitty({"KITTY_WINDOW_ID": "1"})
+    assert in_kitty({"TERM": "xterm-kitty"})
+    assert not in_kitty({"TERM": "dumb"})
+    assert not in_kitty({})
+
+
+def test_preview_thumbnail_is_png_bytes(tmp_path) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    from bdl.preview import _resize
+
+    path = tmp_path / "shot.png"
+    Image.new("RGB", (400, 200), (10, 200, 30)).save(path)
+    payload = _resize(path, rows=6)
+    assert payload is not None
+    assert payload.startswith(b"\x89PNG")
+
+
+def test_preview_skips_a_file_that_is_not_an_image(tmp_path) -> None:
+    from bdl.preview import _resize
+
+    broken = tmp_path / "not.png"
+    broken.write_bytes(b"nope")
+    assert _resize(broken, rows=4) is None
+
+
+def test_gauge_splits_the_bar_into_full_and_empty_cells() -> None:
+    from bdl.downloader import _gauge
+
+    filled, empty = _gauge(50, 10)
+    assert (len(filled), len(empty)) == (5, 5)
+    assert set(filled) == {"█"} and set(empty) == {"━"}
+    # Clamped at both ends: a task can report more bytes than it announced.
+    assert _gauge(120, 8) == ("█" * 8, "")
+    assert _gauge(-5, 8) == ("", "━" * 8)
+
+
+def test_progress_file_row_has_a_gauge_and_a_spinner() -> None:
+    from rich.text import Text
+
+    from bdl.downloader import TransferProgress
+
+    bar = TransferProgress()
+    bar.start("Gelbooru", 4)
+    task_id = bar.begin_file("miku.png", 1024)
+    bar.chunk(task_id, 512)
+    lines = next(iter(bar._progress.get_renderables())).plain.split("\n")
+    row = lines[1]
+    assert "█" in row and "━" in row
+    assert "50%" in row
+    assert "512.0 B/1.0 KiB" in row
+    assert isinstance(bar._progress.get_renderables(), object)  # still one Text
+    assert isinstance(next(iter(bar._progress.get_renderables())), Text)

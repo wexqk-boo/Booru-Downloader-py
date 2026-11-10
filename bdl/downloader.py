@@ -27,13 +27,14 @@ from rich.console import RenderableType
 from rich.progress import Progress, Task
 from rich.text import Text
 
-from . import USER_AGENT
+from . import USER_AGENT, XBOORU_USER_AGENT, preview
 from .db import Database
 from .filters import aspect_state
 from .media import SIDECAR_DIR, VIDEO_EXTENSIONS, media_paths, media_subdir, rating_bucket
 from .meta import ext_for_file_url, filename_for, write_sidecar
 from .models import Post
 from .net.doh import DoHResolver
+from .perceptual import is_duplicate, phash_of_file
 from .providers import Provider, ProviderClient
 
 LOG = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ BATCH_SIZE = 20
 
 DOWNLOADED = "downloaded"
 SKIPPED = "skipped"
+DUPLICATE = "duplicate"
 FAILED = "failed"
 
 # Re-exported so callers that used the old layout module keep working.
@@ -52,6 +54,7 @@ VIDEO_EXTS = VIDEO_EXTENSIONS
 __all__ = [
     "BATCH_SIZE",
     "DOWNLOADED",
+    "DUPLICATE",
     "FAILED",
     "SIDECAR_DIR",
     "SKIPPED",
@@ -86,6 +89,20 @@ def _fmt_duration(seconds: float) -> str:
 def _blocks(pct: float, width: int = 16) -> str:
     filled = max(0, min(width, round(pct / 100 * width)))
     return "█" * filled + "░" * (width - filled)
+
+
+# Braille spinner: one frame per rendered tick, so it animates while bytes land.
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _spinner() -> str:
+    return _SPINNER_FRAMES[int(time.monotonic() * 12) % len(_SPINNER_FRAMES)]
+
+
+def _gauge(pct: float, width: int) -> tuple[str, str]:
+    """Split a bar into its filled and empty halves, both one cell per step."""
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "█" * filled, "━" * (width - filled)
 
 
 def _clip(text: str, width: int) -> str:
@@ -131,7 +148,7 @@ class _TransferDisplay(Progress):
         for task in self.tasks:
             if not task.visible:
                 continue
-            line = self._aggregate_line(task) if task.fields.get("aggregate") else self._file_line(task, width)
+            line = self._aggregate_line(task, width) if task.fields.get("aggregate") else self._file_line(task, width)
             line.truncate(width)
             lines.append(line)
         yield Text("\n").join(lines) if lines else Text("")
@@ -139,27 +156,42 @@ class _TransferDisplay(Progress):
     def _file_line(self, task: Task, width: int) -> Text:
         total = _fmt_bytes(task.total) if task.total else "?"
         pct = min(task.completed / task.total * 100, 100) if task.total else 0.0
-        tail = (
-            f"{_blocks(pct)} {pct:>3.0f}% "
-            f"{_fmt_bytes(task.completed)}/{total}  {_fmt_speed(float(task.fields.get('speed', 0.0)))}"
+        bar_width = 18
+        filled, empty = _gauge(pct, bar_width)
+        speed = _fmt_speed(float(task.fields.get("speed", 0.0)))
+        tail = f" {pct:>3.0f}%  {_fmt_bytes(task.completed)}/{total}  {speed}"
+        prefix = f"{_spinner()} "
+        name_width = max(12, width - cell_len(prefix) - bar_width - cell_len(tail) - 3)
+        return Text.assemble(
+            (prefix, "cyan"),
+            (_pad(str(task.description), name_width), ""),
+            "  ",
+            (filled, "cyan"),
+            (empty, "grey37"),
+            (tail, "cyan" if pct >= 100 else ""),
         )
-        name_width = max(12, width - cell_len(tail) - 2)
-        return Text(f"{_pad(str(task.description), name_width)}  {tail}")
 
-    def _aggregate_line(self, task: Task) -> Text:
+    def _aggregate_line(self, task: Task, width: int) -> Text:
         eta = ""
         if self.planned_bytes > self.total_bytes and self.speed > 0:
-            eta = f" ETA {_fmt_duration((self.planned_bytes - self.total_bytes) / self.speed)}"
+            eta = f"  ETA {_fmt_duration((self.planned_bytes - self.total_bytes) / self.speed)}"
         counter = f"{int(task.completed)} / {int(task.total or 0)}"
+        gauge_width = max(8, min(24, width // 4))
+        pct = min(task.completed / task.total * 100, 100) if task.total else 0.0
+        filled, empty = _gauge(pct, gauge_width)
         return Text.assemble(
-            (_fmt_bytes(self.total_bytes), "cyan"),
-            " ",
+            ("⠿ ", "cyan"),
+            (filled, "cyan"),
+            (empty, "grey37"),
+            "  ",
+            (counter, "bold"),
+            "  ",
+            (_fmt_bytes(self.total_bytes), "bold cyan"),
+            "  ",
             (_fmt_speed(self.speed), "cyan"),
             (eta, "dim"),
             "  ",
-            (str(task.fields.get("counts", "")), "dim"),
-            "  ",
-            (counter, "bold"),
+            (str(task.fields.get("counts", "")), "green"),
             "  ",
             (_fmt_duration(task.elapsed), "dim"),
         )
@@ -198,7 +230,7 @@ class TransferProgress:
         self._planned_bytes = max(0, total_bytes)
         self._progress.planned_bytes = self._planned_bytes
 
-    def update_aggregate(self, processed: int, downloaded: int, skipped: int, failed: int) -> None:
+    def update_aggregate(self, processed: int, downloaded: int, skipped: int, failed: int, duplicates: int = 0) -> None:
         now = time.monotonic()
         if (window := now - self._w_start) >= 0.4:
             instant = self._w_bytes / window
@@ -206,10 +238,13 @@ class TransferProgress:
             self._w_start = now
             self._w_bytes = 0
         self._progress.speed = self._speed
+        counts = f"+{downloaded} ={skipped} x{failed}"
+        if duplicates:
+            counts += f" ~{duplicates}"
         self._progress.update(
             self._agg_task,  # type: ignore[arg-type]
             completed=processed,
-            counts=f"+{downloaded} ={skipped} x{failed}",
+            counts=counts,
         )
 
     def add_bytes(self, n: int) -> None:
@@ -268,6 +303,8 @@ class BatchStats:
     filtered: int = 0
     downloaded: int = 0
     skipped: int = 0
+    #: Skipped because the picture is already in the library under another id.
+    duplicates: int = 0
     failed: int = 0
     unknown_aspect: int = 0
     failures: list[tuple[Post, str]] = field(default_factory=list)
@@ -292,6 +329,8 @@ class Downloader:
         aspect_range: tuple[float, float] | None = None,
         aspect_unknown: str = "keep",
         progress: bool = False,
+        dedup: bool = True,
+        preview: bool = False,
     ) -> None:
         self._db = db
         self._out_root = out_root
@@ -308,6 +347,14 @@ class Downloader:
         self._aspect_range = aspect_range
         self._aspect_unknown = aspect_unknown
         self._progress_enabled = progress
+        self._dedup = dedup
+        #: Draw a thumbnail in Kitty once a file lands. Only set when the user
+        #: asked for it, so nothing is decoded on a normal run.
+        self._preview = preview
+        self._preview_paths: list[Path] = []
+        #: (uid, phash) pairs loaded once per run; refreshed as files land so a
+        #: duplicate inside the same batch is caught too.
+        self._phashes: list[tuple[str, str]] | None = None
         self._bar: TransferProgress | None = None
         self._session: aiohttp.ClientSession | None = None
         self._resolver = DoHResolver()
@@ -436,6 +483,51 @@ class Downloader:
         else:
             LOG.warning(message, *args)
 
+    def _is_duplicate_picture(self, phash: str, uid: str = "") -> bool:
+        """Whether this pHash matches a picture already in the library.
+
+        The hash list is loaded once per run and kept up to date locally, so
+        every comparison is plain arithmetic: SQLite has no bit-distance
+        operator, and a Hamming comparison in Python over a few thousand rows
+        is far cheaper than a query per file.
+
+        The post's own earlier record is skipped: with ``--force`` the picture
+        is deliberately fetched a second time, and its own stored hash would
+        otherwise reject the very file the user asked for.
+        """
+        if self._phashes is None:
+            return False
+        return any(is_duplicate(phash, known) for known_uid, known in self._phashes if known_uid != uid)
+
+    async def _load_phashes(self) -> None:
+        if not self._dedup or self._phashes is not None:
+            return
+        self._phashes = await self._db.all_phashes()
+
+    def _remember_phash(self, uid: str, phash: str | None) -> None:
+        """Add a freshly stored hash so the rest of the batch can see it."""
+        if self._phashes is not None and phash:
+            self._phashes.append((uid, phash))
+
+    def collect_preview(self, path: Path) -> None:
+        """Queue a finished picture for the gallery drawn after the batch.
+
+        Drawing mid-run would fight the progress display for the same rows of
+        the terminal, so previews wait until every board is done.
+        """
+        self._preview_paths.append(path)
+
+    def show_previews(self) -> None:
+        """Draw the queued thumbnails, when the terminal can show them."""
+        paths, self._preview_paths = self._preview_paths, []
+        if not paths or not preview.available():
+            return
+        for path in paths:
+            try:
+                preview.show(path)
+            except (OSError, ValueError) as exc:
+                LOG.debug("preview failed for %s: %s", path, exc)
+
     async def download_post(self, provider: Provider, post: Post) -> tuple[str, str | None, tuple | None]:
         """Download one post; returns ``(status, error, metadata_row)``."""
         ext = ext_for_file_url(post.file_url) or ".bin"
@@ -451,8 +543,11 @@ class Downloader:
         if self._sidecar:
             sidecar_dir.mkdir(parents=True, exist_ok=True)
 
-        # Some boards reject hotlinks without a matching Referer.
+        # Some boards reject hotlinks without a matching Referer, and Xbooru's
+        # Cloudflare edge challenges the plain tool User-Agent.
         headers = {"Referer": f"{provider.base_url.rstrip('/')}/"}
+        if provider.key == "xbooru":
+            headers["User-Agent"] = XBOORU_USER_AGENT
         last_error: Exception | None = None
         for attempt in range(MAX_ATTEMPTS):
             try:
@@ -477,14 +572,10 @@ class Downloader:
                         return FAILED, f"exceeds --max-size-mb ({length} bytes)", None
 
                     bar = self._bar
-                    progress_task = (
-                        bar.begin_file(f"{filename}", resp.content_length) if bar is not None else None
-                    )
+                    progress_task = bar.begin_file(f"{filename}", resp.content_length) if bar is not None else None
                     digest = hashlib.sha256() if self._checksum else None
                     try:
-                        size = await self._stream_to_file(
-                            resp, tmp_path, digest, bar, progress_task
-                        )
+                        size = await self._stream_to_file(resp, tmp_path, digest, bar, progress_task)
                     except BaseException:
                         await asyncio.to_thread(tmp_path.unlink, missing_ok=True)
                         raise
@@ -499,6 +590,14 @@ class Downloader:
                         await asyncio.to_thread(tmp_path.unlink, missing_ok=True)
                         return FAILED, "empty file", None
 
+                    # Perceptual dedup, before the file is given its real name:
+                    # the same artwork is reposted across boards under different
+                    # ids, so uid and sha256 both miss it.
+                    phash = await asyncio.to_thread(phash_of_file, tmp_path)
+                    if phash is not None and self._is_duplicate_picture(phash, post.uid):
+                        await asyncio.to_thread(tmp_path.unlink, missing_ok=True)
+                        return DUPLICATE, None, None
+
                     # Rename only after a complete, validated transfer so a
                     # half-written file never appears under its real name.
                     await asyncio.to_thread(os.replace, tmp_path, final_path)
@@ -507,7 +606,13 @@ class Downloader:
                         await asyncio.to_thread(
                             write_sidecar, sidecar_dir / f"{filename}.json", post, time.time(), sha256
                         )
-                    return DOWNLOADED, None, self._metadata_row(post, final_path, size, filename, sha256)
+                    if self._preview:
+                        await asyncio.to_thread(self.collect_preview, final_path)
+                    return (
+                        DOWNLOADED,
+                        None,
+                        self._metadata_row(post, final_path, size, filename, sha256, phash),
+                    )
             except (_RetryableError, TimeoutError, aiohttp.ClientError) as exc:
                 last_error = exc
                 self._warn(
@@ -550,7 +655,12 @@ class Downloader:
 
     @staticmethod
     def _metadata_row(
-        post: Post, final_path: Path, size: int, filename: str, sha256: str | None
+        post: Post,
+        final_path: Path,
+        size: int,
+        filename: str,
+        sha256: str | None,
+        phash: str | None = None,
     ) -> tuple:
         return (
             post.uid,
@@ -566,6 +676,7 @@ class Downloader:
             post.score,
             post.file_url,
             sha256,
+            phash,
             time.time(),
         )
 
@@ -640,22 +751,25 @@ class Downloader:
         if self._bar is not None:
             self._bar.start(provider.title, len(todo))
 
+        await self._load_phashes()
+
         # Smallest first: the API already reports sizes, so no HEAD requests.
         if len(todo) > 3 and any(post.file_size is not None for post in todo):
             todo.sort(key=lambda post: post.file_size or 0)
             if self._bar is not None:
                 self._bar.set_planned(sum(post.file_size or 0 for post in todo))
 
-        processed = downloaded_n = skipped_n = failed_n = 0
+        processed = downloaded_n = skipped_n = failed_n = duplicates_n = 0
         batch_meta: list[tuple] = []
 
         async def worker(post: Post) -> tuple[str, str | None, tuple | None]:
-            nonlocal processed, downloaded_n, skipped_n, failed_n
+            nonlocal processed, downloaded_n, skipped_n, failed_n, duplicates_n
             status, error, meta = await self.download_post(provider, post)
             processed += 1
             if status == DOWNLOADED:
                 downloaded_n += 1
                 if meta is not None:
+                    self._remember_phash(str(meta[0]), meta[13])
                     batch_meta.append(meta)
                     if len(batch_meta) >= BATCH_SIZE:
                         # Snapshot before awaiting: other workers append while
@@ -663,10 +777,12 @@ class Downloader:
                         await self._flush(batch_meta)
             elif status == SKIPPED:
                 skipped_n += 1
+            elif status == DUPLICATE:
+                duplicates_n += 1
             else:
                 failed_n += 1
             if self._bar is not None:
-                self._bar.update_aggregate(processed, downloaded_n, skipped_n, failed_n)
+                self._bar.update_aggregate(processed, downloaded_n, skipped_n, failed_n, duplicates_n)
             return status, error, meta
 
         try:
@@ -686,6 +802,9 @@ class Downloader:
                 stats.downloaded += 1
             elif status == SKIPPED:
                 stats.skipped += 1
+            elif status == DUPLICATE:
+                stats.skipped += 1
+                stats.duplicates += 1
             else:
                 stats.failed += 1
                 stats.failures.append((post, error or "unknown"))

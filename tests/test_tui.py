@@ -68,9 +68,7 @@ def _fake_module() -> types.ModuleType:
     module.Style = _FakeStyle
     module.print = print
     for kind in ("checkbox", "text", "select", "confirm"):
-        module.__dict__[kind] = (
-            lambda message, _kind=kind, **kwargs: _FakeQuestion(_kind, message, **kwargs)
-        )
+        module.__dict__[kind] = lambda message, _kind=kind, **kwargs: _FakeQuestion(_kind, message, **kwargs)
     return module
 
 

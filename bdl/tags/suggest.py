@@ -56,9 +56,7 @@ async def _remote_hints(prefix: str, limit: int = 10) -> list[str]:
     """Query moebooru tag.json (yande.re); works without auth."""
     try:
         session = await get_session()
-        async with session.get(
-            _MOEBoorU_TAG_API.format(prefix=prefix), headers={"User-Agent": USER_AGENT}
-        ) as response:
+        async with session.get(_MOEBoorU_TAG_API.format(prefix=prefix), headers={"User-Agent": USER_AGENT}) as response:
             if response.status != 200:
                 return []
             data = await response.json()
@@ -102,6 +100,83 @@ def _fuzzy_fix_blocking(tags: str, cutoff: float = 0.6) -> str:
 async def fuzzy_fix(tags: str, cutoff: float = 0.6) -> str:
     """Fix typos; runs in a worker thread so it never stalls the event loop."""
     return await asyncio.to_thread(_fuzzy_fix_blocking, tags, cutoff)
+
+
+# Popular board tags, loaded once. Big enough to catch real typos, small
+# enough that a scan stays instant.
+_POPULAR_LIMIT = 20000
+_corrections: tuple[int, set[str]] | None = None
+
+
+def _correction_pool() -> set[str]:
+    """Tag names worth correcting towards: the dictionary plus popular tags.
+
+    The board CSV is 170k names, and comparing every typo against all of them
+    pulls in obscure tags — ``sakura`` matched ``sakurea`` (197 posts) instead
+    of staying put. The popular slice keeps suggestions plausible.
+    """
+    global _corrections
+    pool = {
+        canonical(tag)
+        for tag in (
+            *ALIASES,
+            *ALIASES.values(),
+            *RU_SLANG,
+            *RU_SLANG.values(),
+            *(tag for group in TAG_LIBRARY.values() for tag in group.values()),
+        )
+    }
+    try:
+        from .store import db_path, parse_csv
+
+        path = db_path()
+        if not path.is_file():
+            return pool
+        key = path.stat().st_mtime_ns
+        if _corrections is not None and _corrections[0] == key:
+            return pool | _corrections[1]
+        data = parse_csv(path)
+        ranked = sorted(zip(data.names, data.counts, strict=True), key=lambda pair: pair[1], reverse=True)
+        popular = {name for name, _ in ranked[:_POPULAR_LIMIT]}
+        _corrections = (key, popular)
+        pool |= popular
+    except (OSError, ValueError, KeyError) as exc:
+        LOG.debug("no tag list for typo correction: %s", exc)
+    return pool
+
+
+def correct_typos(tags: str, cutoff: int = 82) -> tuple[str, list[tuple[str, str]]]:
+    """Nudge misspelled tags towards real ones: ``mku`` becomes ``miku``.
+
+    Only tokens that are not tags themselves are touched, so ``1girl`` and
+    every bare shorthand stay exactly as typed. Returns the new tag string and
+    the substitutions that were made, for the caller to log.
+    """
+    tokens = tags.split()
+    if not tokens:
+        return tags, []
+    try:
+        from rapidfuzz import fuzz, process
+    except ImportError:
+        return tags, []
+
+    pool = _correction_pool()
+    fixed: list[str] = []
+    changes: list[tuple[str, str]] = []
+    for token in tokens:
+        negated = token.startswith("-")
+        bare = canonical(token.lstrip("-"))
+        if not bare or bare in pool:
+            fixed.append(token)
+            continue
+        match = process.extractOne(bare, pool, scorer=fuzz.ratio, score_cutoff=cutoff)
+        if match is None or match[0] == bare:
+            fixed.append(token)
+            continue
+        replacement = match[0]
+        changes.append((bare, replacement))
+        fixed.append("-" + replacement if negated else replacement)
+    return " ".join(fixed), changes
 
 
 async def suggest_tags(prefix: str, limit: int = 10) -> list[str]:

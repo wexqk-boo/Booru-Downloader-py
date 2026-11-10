@@ -11,6 +11,7 @@
   "tui.source_all": "All sources",
   "tui.tags": "Tags",
   "tui.tags_hint": "Search query (may be left empty)",
+  "tui.tags_fixed": "Looks like a typo: {typed} → {tag}",
   "tui.limit": "Limit",
   "tui.limit_hint": "Posts per source (a positive whole number)",
   "tui.limit_invalid": "Enter a whole number greater than zero",
