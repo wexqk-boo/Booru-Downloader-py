@@ -277,10 +277,16 @@ def _label(key: str) -> str:
 
 
 def _print_failed_providers(failed: list[str]) -> None:
-    if failed:
-        print("\nSources with errors:")
-        for item in failed:
-            print(f"  {item}")
+    """Board-level problems, listed after the summary.
+
+    A board that is down (503), throttles or rejects the key only costs its own
+    batch; the remaining sources keep downloading and the reason shows up here.
+    """
+    if not failed:
+        return
+    print("\nSources with errors (the rest of the batch is unaffected):")
+    for item in failed:
+        print(f"  x {item}")
 
 
 def _print_summary(all_stats: dict[str, BatchStats]) -> None:
@@ -442,9 +448,11 @@ async def _execute_batch(
                     order=args.order,
                 )
             except ProviderError as exc:
+                # A board can be down, throttling or rejecting the key; that
+                # only costs its own batch, so record the reason and move on.
                 all_sources_failed = True
                 failed_providers.append(f"{provider.key} ({exc})")
-                LOG.error("%s: %s", provider.title, exc)
+                LOG.warning("%s: %s", provider.title, exc)
                 await db.finish_run(run_id, found=0, filtered=0, downloaded=0, skipped=0, failed=0)
                 continue
             await db.finish_run(
@@ -559,7 +567,7 @@ async def cmd_tui(args: argparse.Namespace) -> int:
     args.checksum = bool(options.get("checksum"))
     args.force = bool(options.get("force"))
     args.no_notify = not options.get("notify", True)
-    # The wizard already resolved the geometry and persisted blacklist edits.
+    # The wizard already resolved the geometry and wrote the blacklist file.
     args.aspect_range = answers.get("aspect")
     args.aspect_ratio = None
     args.wallpapers = args.avatars = False

@@ -2,7 +2,9 @@
 
 ``questionary`` is replaced by a scripted double, so the tests cover the
 assembly of the answer dictionary (including the steps that only exist in the
-wizard) without touching a terminal or the network.
+wizard) without touching a terminal or the network. The config directory is
+redirected to a throwaway path, so the blacklist and the remembered folder
+stay inside the test.
 """
 
 from __future__ import annotations
@@ -14,11 +16,14 @@ from typing import Any
 
 import pytest
 
+from bdl.blacklist import load_blacklist
 from bdl.config import get_setting
 from bdl.i18n import t
 from bdl.tui import wizard
 
 PROMPT_LOG: list[str] = []
+#: Free-form answers the scripted prompts return, keyed by prompt message.
+TEXT_ANSWERS: dict[str, str] = {}
 
 
 class _FakeQuestion:
@@ -33,19 +38,15 @@ class _FakeQuestion:
         if self.kind == "confirm":
             return True
         if self.kind == "checkbox":
-            if self.message == t("tui.blacklist"):
-                return list(self.values)
-            if self.message == t("tui.options"):
-                return ["sidecar", "notify"]
             return list(self.values)
         if self.kind == "select":
             return self.kwargs["choices"][0].value
         if self.kind == "text":
+            if self.message in TEXT_ANSWERS:
+                return TEXT_ANSWERS[self.message]
             default = self.kwargs.get("default", "")
-            if default:
-                return default
             # The tags prompt is the only empty one that expects content.
-            return "1girl" if self.message == t("tui.tags") else ""
+            return "1girl" if self.message == t("tui.tags") else default
         raise AssertionError(self.kind)
 
 
@@ -76,36 +77,39 @@ def _fake_module() -> types.ModuleType:
 @pytest.fixture()
 def scripted(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     monkeypatch.setitem(sys.modules, "questionary", _fake_module())
-    # The wizard persists blacklist edits through these helpers; a test must
-    # never rewrite the user's real ~/.config/bdl/blacklist.txt.
-    monkeypatch.setattr(wizard, "add_tag", lambda tag: None)
-    monkeypatch.setattr(wizard, "remove_tag", lambda tag: None)
-    # Same for the remembered output folder: point the config at a throwaway
-    # file, so the folder question is asked and the answer stays local.
+    # Keep the remembered folder and the blacklist inside the test.
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     PROMPT_LOG.clear()
+    TEXT_ANSWERS.clear()
 
 
-def test_wizard_collects_every_download_option(scripted: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(wizard, "load_blacklist", lambda: {"ai"})
+def test_wizard_collects_every_download_option(scripted: None) -> None:
+    TEXT_ANSWERS[t("tui.blacklist")] = "ai"
     answers = asyncio.run(wizard.run_wizard())
 
     assert answers is not None
     assert answers["sources"]
     assert answers["limit"] == 50
-    assert answers["concurrency"] == 3
+    assert answers["concurrency"] == wizard.DEFAULT_CONCURRENCY == 8
     assert answers["order"] == ""
-    assert answers["options"] == {
-        "sidecar": True,
-        "checksum": False,
-        "force": False,
-        "notify": True,
-    }
-    assert answers["blacklist"] == {"ai"}
+    assert answers["options"] == wizard.DEFAULT_OPTIONS
+    assert answers["options"]["notify"] is True
+    assert answers["options"]["sidecar"] is False
+    # A root expands into its whole family instead of a single tag.
+    assert "ai" in answers["blacklist"]
+    assert "ai_generated" in answers["blacklist"]
+    assert load_blacklist() == answers["blacklist"]
 
 
-def test_wizard_asks_every_screen_in_order(scripted: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(wizard, "load_blacklist", lambda: {"ai"})
+def test_wizard_leaves_no_blacklist_when_the_field_is_empty(scripted: None) -> None:
+    answers = asyncio.run(wizard.run_wizard())
+
+    assert answers is not None
+    assert answers["blacklist"] == set()
+    assert load_blacklist() == set()
+
+
+def test_wizard_asks_every_screen_in_order(scripted: None) -> None:
     asyncio.run(wizard.run_wizard())
 
     expected = [
@@ -116,17 +120,21 @@ def test_wizard_asks_every_screen_in_order(scripted: None, monkeypatch: pytest.M
         t("tui.category"),
         t("tui.geometry"),
         t("tui.blacklist"),
-        t("tui.blacklist_extra"),
         t("tui.out"),
-        t("tui.concurrency"),
-        t("tui.options"),
         t("tui.confirm"),
     ]
     assert expected == PROMPT_LOG
 
 
-def test_wizard_remembers_the_output_folder(scripted: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
-    monkeypatch.setattr(wizard, "load_blacklist", lambda: set())
+def test_wizard_has_no_concurrency_or_options_screen(scripted: None) -> None:
+    asyncio.run(wizard.run_wizard())
+
+    assert t("tui.concurrency") not in PROMPT_LOG
+    assert t("tui.options") not in PROMPT_LOG
+    assert t("tui.blacklist_extra") not in PROMPT_LOG
+
+
+def test_wizard_remembers_the_output_folder(scripted: None) -> None:
     asyncio.run(wizard.run_wizard())
     assert t("tui.out") in PROMPT_LOG
     saved = get_setting("out")
@@ -139,10 +147,7 @@ def test_wizard_remembers_the_output_folder(scripted: None, monkeypatch: pytest.
     assert get_setting("out") == saved
 
 
-def test_wizard_env_out_wins_and_is_not_saved(
-    scripted: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
-    monkeypatch.setattr(wizard, "load_blacklist", lambda: set())
+def test_wizard_env_out_wins_and_is_not_saved(scripted: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     monkeypatch.setenv("BDL_OUT", str(tmp_path / "env-lib"))
     answers = asyncio.run(wizard.run_wizard())
 
@@ -151,21 +156,6 @@ def test_wizard_env_out_wins_and_is_not_saved(
     assert t("tui.out") not in PROMPT_LOG
     # The environment is the caller's business; the wizard must not persist it.
     assert get_setting("out") == ""
-
-
-def test_wizard_defaults_keep_the_done_notification(scripted: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(wizard, "load_blacklist", lambda: set())
-    captured: dict[str, Any] = {}
-
-    original = wizard._ask_options
-
-    async def spy(q: Any, defaults: dict[str, Any]) -> Any:
-        captured["defaults"] = defaults
-        return await original(q, defaults)
-
-    monkeypatch.setattr(wizard, "_ask_options", spy)
-    asyncio.run(wizard.run_wizard())
-    assert captured["defaults"] == {}
 
 
 def test_geometry_descriptions() -> None:

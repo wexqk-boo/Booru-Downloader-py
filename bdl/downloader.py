@@ -15,14 +15,19 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiofiles
 import aiohttp
-from rich.progress import Progress, ProgressColumn, Task, TextColumn, TimeElapsedColumn
+from rich import get_console
+from rich.cells import cell_len, set_cell_size
+from rich.console import RenderableType
+from rich.progress import Progress, Task
 from rich.text import Text
 
+from . import USER_AGENT
 from .db import Database
 from .filters import aspect_state
 from .media import SIDECAR_DIR, VIDEO_EXTENSIONS, media_paths, media_subdir, rating_bucket
@@ -33,7 +38,6 @@ from .providers import Provider, ProviderClient
 
 LOG = logging.getLogger(__name__)
 
-USER_AGENT = "bdl/2.0 (+aiohttp)"
 CHUNK_SIZE = 64 * 1024
 BUFFER_SIZE = 2 * 1024 * 1024
 MAX_ATTEMPTS = 3
@@ -80,80 +84,119 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _blocks(pct: float, width: int = 16) -> str:
-    filled = round(pct / 100 * width)
+    filled = max(0, min(width, round(pct / 100 * width)))
     return "█" * filled + "░" * (width - filled)
 
 
-class _BlocksColumn(ProgressColumn):
-    """Bar that still renders when the total size is unknown."""
-
-    def render(self, task: Task) -> Text:
-        if not task.total:
-            return Text(_fmt_bytes(task.completed))
-        pct = task.completed / task.total * 100
-        return Text(f"{_blocks(pct)} {pct:>3.0f}% {_fmt_bytes(task.completed)}/{_fmt_bytes(task.total)}")
-
-
-class _SpeedColumn(ProgressColumn):
-    def render(self, task: Task) -> Text:
-        return Text(_fmt_speed(float(task.fields.get("speed", 0.0))), style="cyan")
+def _clip(text: str, width: int) -> str:
+    """Trim *text* to a terminal cell budget, with an ellipsis when cut."""
+    if width <= 0:
+        return ""
+    if cell_len(text) <= width:
+        return text
+    return set_cell_size(text, width - 1) + "…"
 
 
-class _EtaColumn(ProgressColumn):
-    def render(self, task: Task) -> Text:
-        total, speed = task.total, float(task.fields.get("speed", 0.0))
-        if not total or speed <= 0:
-            return Text("")
-        return Text(f"ETA {_fmt_duration((total - task.completed) / speed)}", style="dim")
+def _pad(text: str, width: int) -> str:
+    """Pad by rendered cell width, so wide characters keep the columns aligned."""
+    clipped = _clip(text, width)
+    return clipped + " " * max(0, width - cell_len(clipped))
+
+
+class _TransferDisplay(Progress):
+    """Progress that draws every row as one hard-clipped line.
+
+    rich's task table shares a single width budget across all rows, so a long
+    aggregate line widens the description column and wraps every file row onto
+    a second terminal line. Building the lines here keeps each row on exactly
+    one line, and clipping guarantees the display never scrolls.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.total_bytes = 0
+        self.speed = 0.0
+        self.planned_bytes = 0
+
+    def _width(self) -> int:
+        # rich builds the initial renderable before ``self.live`` exists, so
+        # fall back to the global console during construction.
+        live = getattr(self, "live", None)
+        console = live.console if live is not None else get_console()
+        return max(24, console.width)
+
+    def get_renderables(self) -> Iterable[RenderableType]:
+        width = self._width()
+        lines: list[Text] = []
+        for task in self.tasks:
+            if not task.visible:
+                continue
+            line = self._aggregate_line(task) if task.fields.get("aggregate") else self._file_line(task, width)
+            line.truncate(width)
+            lines.append(line)
+        yield Text("\n").join(lines) if lines else Text("")
+
+    def _file_line(self, task: Task, width: int) -> Text:
+        total = _fmt_bytes(task.total) if task.total else "?"
+        pct = min(task.completed / task.total * 100, 100) if task.total else 0.0
+        tail = (
+            f"{_blocks(pct)} {pct:>3.0f}% "
+            f"{_fmt_bytes(task.completed)}/{total}  {_fmt_speed(float(task.fields.get('speed', 0.0)))}"
+        )
+        name_width = max(12, width - cell_len(tail) - 2)
+        return Text(f"{_pad(str(task.description), name_width)}  {tail}")
+
+    def _aggregate_line(self, task: Task) -> Text:
+        eta = ""
+        if self.planned_bytes > self.total_bytes and self.speed > 0:
+            eta = f" ETA {_fmt_duration((self.planned_bytes - self.total_bytes) / self.speed)}"
+        counter = f"{int(task.completed)} / {int(task.total or 0)}"
+        return Text.assemble(
+            (_fmt_bytes(self.total_bytes), "cyan"),
+            " ",
+            (_fmt_speed(self.speed), "cyan"),
+            (eta, "dim"),
+            "  ",
+            (str(task.fields.get("counts", "")), "dim"),
+            "  ",
+            (counter, "bold"),
+            "  ",
+            (_fmt_duration(task.elapsed), "dim"),
+        )
 
 
 class TransferProgress:
-    """Aggregate line plus one row per active file.
+    """One aggregate line plus a row per file that is still in flight.
 
-    Finished rows linger briefly so their final percentage is readable before
-    they disappear.
+    A finished file leaves the display the moment its last byte lands, so the
+    terminal only ever shows active downloads and never grows a wall of
+    completed rows.
     """
 
-    HOLD_FINISHED = 0.7
-
     def __init__(self) -> None:
-        self._progress = Progress(
-            TextColumn("[progress.description]{task.description}", justify="left"),
-            _BlocksColumn(),
-            _SpeedColumn(),
-            _EtaColumn(),
-            TimeElapsedColumn(),
-        )
+        self._progress = _TransferDisplay()
         self._agg_task: int | None = None
         self._total_bytes = 0
         self._speed = 0.0
         self._planned_bytes = 0
         self._w_start = time.monotonic()
         self._w_bytes = 0
-        self._hide_loop: asyncio.Task | None = None
-        self._pending_hides: list[tuple[int, float]] = []
+        self._console = get_console()
+
+    def _task(self, task_id: int) -> Task | None:
+        """Look a task up by id; ids survive removals of other rows."""
+        for task in self._progress.tasks:
+            if task.id == task_id:
+                return task
+        return None
 
     def start(self, label: str, total: int) -> None:
         self._progress.start()
-        self._agg_task = self._progress.add_task(label, total=total)
-        self._hide_loop = asyncio.create_task(self._hide_finished())
-
-    async def _hide_finished(self) -> None:
-        try:
-            while True:
-                now = time.monotonic()
-                due = [entry for entry in self._pending_hides if entry[1] <= now]
-                if due:
-                    self._pending_hides = [entry for entry in self._pending_hides if entry not in due]
-                    for task_id, _ in due:
-                        if 0 <= task_id < len(self._progress.tasks):
-                            self._progress.update(task_id, visible=False)
-                await asyncio.sleep(0.15)
-        except asyncio.CancelledError:
-            pass
+        self._agg_task = self._progress.add_task(label, total=total, aggregate=True)
 
     def set_planned(self, total_bytes: int) -> None:
         self._planned_bytes = max(0, total_bytes)
+        self._progress.planned_bytes = self._planned_bytes
 
     def update_aggregate(self, processed: int, downloaded: int, skipped: int, failed: int) -> None:
         now = time.monotonic()
@@ -162,16 +205,17 @@ class TransferProgress:
             self._speed = instant if self._speed == 0 else self._speed * 0.6 + instant * 0.4
             self._w_start = now
             self._w_bytes = 0
-        counts = f"[green]+{downloaded}[/] [dim]={skipped}[/] [red]x{failed}[/]"
-        eta = ""
-        if self._planned_bytes > self._total_bytes and self._speed > 0:
-            eta = f" ETA {_fmt_duration((self._planned_bytes - self._total_bytes) / self._speed)}"
-        description = f"[cyan]{_fmt_bytes(self._total_bytes)}[/] {_fmt_speed(self._speed)}{eta}  {counts}"
-        self._progress.update(self._agg_task, completed=processed, description=description)  # type: ignore[arg-type]
+        self._progress.speed = self._speed
+        self._progress.update(
+            self._agg_task,  # type: ignore[arg-type]
+            completed=processed,
+            counts=f"+{downloaded} ={skipped} x{failed}",
+        )
 
     def add_bytes(self, n: int) -> None:
         self._total_bytes += n
         self._w_bytes += n
+        self._progress.total_bytes = self._total_bytes
 
     def begin_file(self, name: str, content_length: int | None) -> int:
         short = name if len(name) <= 42 else name[:39] + "…"
@@ -179,11 +223,11 @@ class TransferProgress:
         return self._progress.add_task(short, total=content_length, speed=0.0, w_start=now, w_bytes=0)
 
     def chunk(self, task_id: int, nbytes: int) -> None:
-        # The row may already be hidden by finish_file; rich would shift ids.
-        if not (0 <= task_id < len(self._progress.tasks)):
+        # The row may already be gone: a finished file is removed, not hidden.
+        task = self._task(task_id)
+        if task is None:
             return
         now = time.monotonic()
-        task = self._progress.tasks[task_id]
         self._progress.update(task_id, advance=nbytes)
         window = now - float(task.fields.get("w_start", now))
         w_bytes = int(task.fields.get("w_bytes", 0)) + nbytes
@@ -196,18 +240,22 @@ class TransferProgress:
         self.add_bytes(nbytes)
 
     def finish_file(self, task_id: int) -> None:
-        # Rows are hidden rather than removed: removal renumbers the tasks.
-        if not (0 <= task_id < len(self._progress.tasks)):
+        # Remove the row outright: the display keeps only work still in flight.
+        if self._task(task_id) is None:
             return
-        task = self._progress.tasks[task_id]
-        suffix = f" [green]{task.completed / task.total * 100:>3.0f}%[/]" if task.total else ""
-        self._progress.update(task_id, description=f"[green]ok[/] {task.description}{suffix}")
-        self._pending_hides.append((task_id, time.monotonic() + self.HOLD_FINISHED))
+        self._progress.remove_task(task_id)
+
+    def log(self, message: str, *args: object) -> None:
+        """Write a line without tearing a hole in the live display.
+
+        A plain ``logging`` record goes straight to stderr, which the progress
+        bar repaints several times a second, so the text lands in the middle of
+        the bars. ``console.print`` goes through rich, which clears the live
+        region first and redraws it afterwards.
+        """
+        self._console.print(message % args if args else message, markup=False, highlight=False, style="dim")
 
     def stop(self) -> None:
-        if self._hide_loop is not None:
-            self._hide_loop.cancel()
-            self._hide_loop = None
         self._progress.stop()
 
 
@@ -363,11 +411,11 @@ class Downloader:
             if recorded_path and recorded_hash:
                 path = Path(recorded_path)
                 if not await asyncio.to_thread(path.is_file):
-                    LOG.warning("recorded file is gone, re-downloading: %s", path)
+                    self._warn("recorded file is gone, re-downloading: %s", path)
                 elif await asyncio.to_thread(self._sha256_of_file, path) == recorded_hash:
                     return True
                 else:
-                    LOG.warning("checksum mismatch, re-downloading: %s", path)
+                    self._warn("checksum mismatch, re-downloading: %s", path)
         elif await asyncio.to_thread(final_path.is_file):
             # Present on disk but absent from the database (pruned, or a
             # different profile wrote it). Re-downloading would be wasteful.
@@ -380,6 +428,13 @@ class Downloader:
                 LOG.debug("same content already stored under another uid: %s", final_path)
                 return True
         return False
+
+    def _warn(self, message: str, *args: object) -> None:
+        """A per-file warning: through the live display when one is running."""
+        if self._bar is not None:
+            self._bar.log(message, *args)
+        else:
+            LOG.warning(message, *args)
 
     async def download_post(self, provider: Provider, post: Post) -> tuple[str, str | None, tuple | None]:
         """Download one post; returns ``(status, error, metadata_row)``."""
@@ -404,7 +459,7 @@ class Downloader:
                 async with self._sem, self._session.get(post.file_url, headers=headers) as resp:  # type: ignore[union-attr]
                     if resp.status == 429:
                         pause = _retry_after(resp.headers.get("Retry-After"))
-                        LOG.warning("%s: rate limited, sleeping %.1fs", post.file_url, pause)
+                        self._warn("%s: rate limited, sleeping %.1fs", post.file_url, pause)
                         await asyncio.sleep(pause)
                         continue
                     if resp.status == 404:
@@ -455,7 +510,7 @@ class Downloader:
                     return DOWNLOADED, None, self._metadata_row(post, final_path, size, filename, sha256)
             except (_RetryableError, TimeoutError, aiohttp.ClientError) as exc:
                 last_error = exc
-                LOG.warning(
+                self._warn(
                     "%s: network error (%s), attempt %d/%d",
                     post.file_url,
                     exc,
@@ -634,7 +689,7 @@ class Downloader:
             else:
                 stats.failed += 1
                 stats.failures.append((post, error or "unknown"))
-                LOG.warning("failed %s: %s", post.uid, error)
+                self._warn("failed %s: %s", post.uid, error)
                 row = (post.uid, post.source, post.id, (error or "unknown")[:500], time.time())
                 failures_batch.append(row)
         if failures_batch:

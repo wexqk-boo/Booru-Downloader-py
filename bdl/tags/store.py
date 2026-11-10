@@ -19,6 +19,7 @@ from urllib.parse import quote_plus
 
 import aiohttp
 
+from .. import USER_AGENT
 from ..config import xdg_cache_home, xdg_data_home
 
 LOG = logging.getLogger(__name__)
@@ -26,7 +27,6 @@ LOG = logging.getLogger(__name__)
 DB_URL = "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru.csv"
 REFRESH_TTL = 7 * 24 * 3600  # 7 days
 DOWNLOAD_TIMEOUT = 90
-USER_AGENT = "bdl/2.0 (tag database)"
 
 CACHE_DIR = xdg_cache_home() / "bdl"
 

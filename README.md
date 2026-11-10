@@ -18,19 +18,21 @@ Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
   `~/.config/bdl/blacklist.txt`, plus a per-run `--blacklist` override.
 - **DNS-over-HTTPS and proxy support** — a built-in `DoHResolver` (Cloudflare)
   works around local DNS blocks on image CDNs, and an upstream proxy can be set.
-- **Interactive wizard** — `bdl` on a terminal (or `bdl tui`) walks through
-  every download parameter: sources with checkboxes, tags with live tag
-  suggestions, limit, sort order, rating, geometry, blacklist, output folder,
-  concurrency and the remaining switches, then prints a summary before starting.
-  The interface ships in Russian (default) and English; `questionary` supplies
-  the arrow-key menus and `rich` the section headers.
+- **Interactive wizard** — `bdl` on a terminal (or `bdl tui`) walks through the
+  download: boards with checkboxes, tags with live tag suggestions, limit, sort
+  order, rating, geometry and an optional list of tags to exclude, then prints a
+  summary before starting. The interface ships in Russian (default) and English;
+  `questionary` supplies the arrow-key menus and `rich` the section headers.
 - **Machine-readable output** — `--json` on `search` and `status`.
 
 ## Installation
 
-Requires Python 3.11+.
+Requires Python 3.11+. The repository is **Booru-Downloader-py**; the console
+command it installs is **`bdl`**.
 
 ```bash
+git clone https://github.com/wexqk-boo/Booru-Downloader-py.git
+cd Booru-Downloader-py
 python3 -m venv .venv
 ./.venv/bin/pip install -e .          # or: pip install -e '.[dev]' for tests/ruff
 ```
@@ -93,14 +95,19 @@ Rating choices are Safe / Suggestive / NSFW / All (`--safe`, `--suggestive`,
 custom `MIN:MAX` range, or no filter. `MIN:MAX` accepts `1.5:1.8`, `1,5:1,8`,
 `1.5/1.8` and width:height shorthands such as `16:9` or `3:4`.
 
+The whole wizard is five screens and takes well under a minute: boards, the tag
+query, limit and geometry, an optional line of tags to exclude, then the
+summary. It never asks about concurrency — 8 parallel transfers keep a 100 Mbit
+line busy — and the JSON/sha256/re-download switches stay off unless you pass
+them to `dl` yourself.
+
 The wizard asks for the output folder only until one is known: the first answer
 is saved to the config and later runs reuse it silently, unless `BDL_OUT` is
-set, which wins outright and is never written back. Alongside the folder it asks
-for the number of parallel downloads, the sort order, and an "extras" screen
-(`--sidecar`, `--checksum`, `--force`, notifications). It finishes with a
-summary of every answer before the final confirmation. The blacklist step lists
-every tag with its family and, for a root tag, the sub-tags that follow it. Tag
-fields complete from the local Danbooru database as you type.
+set, which wins outright and is never written back. The exclusion step is a
+single comma-separated field — a root tag such as `ai` pulls in its whole family,
+an empty answer excludes nothing. Tag fields complete from the local Danbooru
+database as you type, and the run ends with a summary before the final
+confirmation.
 
 Common flags for `dl` / `sync`: `--limit`, `--per-page`, `--out`,
 `--concurrency`, `--sidecar`, `--checksum`, `--force`, `--min-score`,

@@ -11,13 +11,13 @@ from typing import Any
 
 import aiohttp
 
+from .. import USER_AGENT
 from ..models import Post
 from ..net.doh import DoHResolver
 from .base import Provider, ProviderError
 
 LOG = logging.getLogger(__name__)
 
-USER_AGENT = "bdl/2.0 (+aiohttp; autonomous downloader)"
 MAX_ATTEMPTS = 3
 
 

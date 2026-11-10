@@ -321,6 +321,55 @@ def test_fmt_bytes_and_blocks() -> None:
     assert len(_blocks(0)) == 16
 
 
+def test_progress_counts_are_posts_not_bytes() -> None:
+    """The aggregate row shows "44 / 50", never a byte figure for post counts."""
+    from rich.text import Text
+
+    from bdl.downloader import TransferProgress
+
+    bar = TransferProgress()
+    bar.start("Gelbooru", 50)
+    bar._progress.update(bar._agg_task, completed=44)
+    line = next(iter(bar._progress.get_renderables()))
+    rendered = line.plain if isinstance(line, Text) else str(line)
+
+    assert "44 / 50" in rendered
+    assert "44.0 B" not in rendered
+
+
+def test_progress_row_leaves_when_the_file_finishes() -> None:
+    """A completed file is removed from the display, not left behind."""
+    from bdl.downloader import TransferProgress
+
+    bar = TransferProgress()
+    bar.start("Gelbooru", 4)
+    task_id = bar.begin_file("done.png", 1024)
+    bar.chunk(task_id, 1024)
+    assert len(bar._progress.tasks) == 2
+
+    bar.finish_file(task_id)
+    assert [task.id for task in bar._progress.tasks] == [bar._agg_task]
+    # A late chunk for a removed row must not raise or resurrect it.
+    bar.chunk(task_id, 512)
+    assert len(bar._progress.tasks) == 1
+
+
+def test_progress_line_fits_the_terminal() -> None:
+    """Rows are clipped, so a repaint never wraps and scrolls the terminal."""
+    from bdl.downloader import TransferProgress
+
+    bar = TransferProgress()
+    bar.start("Gelbooru", 12)
+    task_id = bar.begin_file("x" * 120 + ".jpg", 4096)
+    bar.chunk(task_id, 2048)
+    frame = next(iter(bar._progress.get_renderables()))
+    lines = frame.plain.split("\n")
+
+    assert len(lines) == 2, "one line per visible task"
+    for line in lines:
+        assert len(line) <= max(24, bar._progress._width())
+
+
 def test_media_subdir() -> None:
     from bdl.downloader import media_subdir
 

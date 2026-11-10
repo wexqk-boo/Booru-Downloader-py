@@ -12,6 +12,7 @@ import logging
 
 import aiohttp
 
+from .. import USER_AGENT
 from ..filters import canonical
 from .catalog import ALIASES, RU_SLANG, TAG_LIBRARY
 
@@ -56,7 +57,7 @@ async def _remote_hints(prefix: str, limit: int = 10) -> list[str]:
     try:
         session = await get_session()
         async with session.get(
-            _MOEBoorU_TAG_API.format(prefix=prefix), headers={"User-Agent": "booru-bot"}
+            _MOEBoorU_TAG_API.format(prefix=prefix), headers={"User-Agent": USER_AGENT}
         ) as response:
             if response.status != 200:
                 return []
