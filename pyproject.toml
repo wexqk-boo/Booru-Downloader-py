@@ -1,5 +1,5 @@
 [project]
-name = "bdl"
+name = "booru-dl"
 version = "2.1.0"
 description = "Async batch downloader and sync tool for booru boards"
 readme = "README.md"

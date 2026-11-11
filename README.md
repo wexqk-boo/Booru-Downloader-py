@@ -1,10 +1,14 @@
-[[https://img.shields.io/pypi/v/booru-dl?color=blue]](https://pypi.org/project/booru-dl/)
-[[https://img.shields.io/pypi/pyversions/booru-dl]](https://pypi.org/project/booru-dl/)
-
 # bdl
+
+[![PyPI version](https://img.shields.io/pypi/v/booru-dl?color=blue)](https://pypi.org/project/booru-dl/)
+[![Python versions](https://img.shields.io/pypi/pyversions/booru-dl)](https://pypi.org/project/booru-dl/)
 
 Async batch downloader and sync tool for booru boards (Gelbooru, Rule34,
 Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
+
+<p align="center">
+  <img src="assets/banner.png" alt="booru-dl preview" width="650">
+</p>
 
 ## Features
 
@@ -39,8 +43,14 @@ Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
 
 ## Installation
 
-Requires Python 3.11+. The repository is **Booru-Downloader-py**; the console
-command it installs is **`bdl`**.
+Requires Python 3.11+. The repository is **Booru-Downloader-py**, the package is
+published as **`booru-dl`**, and the console command it installs is **`bdl`**.
+
+```bash
+pip install booru-dl                  # or: pip install 'booru-dl[dev]' for tests/ruff
+```
+
+From a checkout:
 
 ```bash
 git clone https://github.com/wexqk-boo/Booru-Downloader-py.git

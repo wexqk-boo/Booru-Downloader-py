@@ -29,3 +29,6 @@ dist/
 *.flv
 *.wmv
 *.m4v
+
+# The README banner is the one picture that is part of the project itself.
+!assets/*.png
