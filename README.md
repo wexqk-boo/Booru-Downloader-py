@@ -7,7 +7,7 @@ Async batch downloader and sync tool for booru boards (Gelbooru, Rule34,
 Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
 
 <p align="center">
-  <img src="assets/banner.png" alt="booru-dl preview" width="650">
+  <img src="https://raw.githubusercontent.com/wexqk-boo/Booru-Downloader-py/main/assets/banner.png" alt="booru-dl preview" width="650">
 </p>
 
 ## Features
