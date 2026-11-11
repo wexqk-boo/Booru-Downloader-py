@@ -16,8 +16,10 @@ import os
 import sys
 import time
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiofiles
 import aiohttp
@@ -28,6 +30,7 @@ from rich.progress import Progress, Task
 from rich.text import Text
 
 from . import USER_AGENT, XBOORU_HEADERS, preview
+from .config import DEFAULT_CONCURRENCY
 from .db import Database
 from .filters import aspect_state
 from .media import SIDECAR_DIR, VIDEO_EXTENSIONS, media_paths, media_subdir, rating_bucket
@@ -43,6 +46,27 @@ CHUNK_SIZE = 64 * 1024
 BUFFER_SIZE = 2 * 1024 * 1024
 MAX_ATTEMPTS = 3
 BATCH_SIZE = 20
+
+#: Adaptive pool tuning. A gigabit line needs more than eight transfers in
+#: flight before the socket round-trips become the bottleneck, so the pool is
+#: allowed to grow — but only while the boards are actually fast, and it backs
+#: off the moment a host says "too many requests".
+ADAPTIVE_INTERVAL = 1.5
+#: Sustained throughput above which the pool is allowed to grow.
+SCALE_UP_SPEED = 20 * 1024 * 1024
+#: Below this the line is not saturated and growing the pool would only add
+#: sockets; the pool shrinks back towards the configured size instead.
+SCALE_DOWN_SPEED = 6 * 1024 * 1024
+#: A short window, so one fast file cannot permanently inflate the pool.
+SPEED_WINDOW = 0.5
+#: Seconds a host stays throttled after a 429 or a timeout before the pool is
+#: allowed to grow again. Backing off must be instant; recovering must be slow.
+COOLDOWN = 20.0
+#: The pool never grows past this multiple of what the user asked for, so an
+#: adaptive run cannot quietly open dozens of sockets on a modest connection.
+ADAPTIVE_HEADROOM = 2.5
+#: Absolute ceiling, matching the config's own cap.
+MAX_POOL = 20
 
 DOWNLOADED = "downloaded"
 SKIPPED = "skipped"
@@ -60,6 +84,7 @@ __all__ = [
     "FAILED",
     "SIDECAR_DIR",
     "SKIPPED",
+    "AdaptivePool",
     "BatchStats",
     "Downloader",
     "TransferProgress",
@@ -162,6 +187,10 @@ class _TransferDisplay(Progress):
         self.total_bytes = 0
         self.speed = 0.0
         self.planned_bytes = 0
+        #: Parallel transfers the adaptive ramp currently allows, and the
+        #: throughput of the last sampling window, shown next to the totals.
+        self.pool_limit = 0
+        self.window_speed = 0.0
 
     def _width(self) -> int:
         # rich builds the initial renderable before ``self.live`` exists, so
@@ -242,10 +271,12 @@ class _TransferDisplay(Progress):
             Text.assemble(
                 "  ",
                 (str(task.fields.get("counts", "")), "green"),
-                "  ",
-                (_fmt_duration(task.elapsed), "dim"),
             )
         )
+        # The pool size is only drawn once the monitor has sampled it.
+        if self.pool_limit:
+            line.append_text(Text.assemble("  ", (f"⇅{self.pool_limit}", "magenta")))
+        line.append_text(Text.assemble("  ", (_fmt_duration(task.elapsed), "dim")))
         return line
 
 
@@ -281,6 +312,11 @@ class TransferProgress:
     def set_planned(self, total_bytes: int) -> None:
         self._planned_bytes = max(0, total_bytes)
         self._progress.planned_bytes = self._planned_bytes
+
+    def adaptive_note(self, limit: int, speed: float) -> None:
+        """Publish the current pool size so the totals row can show it."""
+        self._progress.pool_limit = limit
+        self._progress.window_speed = speed
 
     def update_aggregate(
         self,
@@ -356,6 +392,136 @@ class TransferProgress:
         self._progress.stop()
 
 
+class AdaptivePool:
+    """A pool whose size follows the line, with a separate leash per host.
+
+    ``asyncio.Semaphore`` cannot shrink, and shrinking is the whole point: when
+    a board answers ``429`` the pool has to back off *now*, not after the
+    transfers already queued finish. A condition variable gives that directly —
+    waiters re-check the budget every time it changes, and a host that is in
+    trouble gets its own smaller cap so one throttled board cannot drag the
+    warm ones down with it.
+    """
+
+    def __init__(self, initial: int, *, ceiling: int, floor: int | None = None) -> None:
+        self._limit = max(1, initial)
+        self._floor = max(1, floor if floor is not None else initial)
+        self._ceiling = max(self._floor, ceiling)
+        self._in_flight = 0
+        self._cond = asyncio.Condition()
+        #: host -> transfers of that host currently in flight.
+        self._host_used: dict[str, int] = {}
+        #: host -> its own cap, lowered after a 429 or a timeout.
+        self._host_cap: dict[str, int] = {}
+        #: host -> monotonic time until which its cap stays lowered.
+        self._penalised: dict[str, float] = {}
+
+    @staticmethod
+    def host_key(url: str) -> str:
+        """The host a request goes to, used to keep throttling per board."""
+        try:
+            return urlsplit(url).netloc.lower()
+        except ValueError:
+            return ""
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    def host_cap(self, host: str) -> int:
+        """How many transfers this host may run at once right now."""
+        return min(self._limit, self._host_cap.get(host, self._limit))
+
+    def penalised(self, host: str, now: float | None = None) -> bool:
+        """True while *host* is serving a cooldown after a 429 or a timeout."""
+        until = self._penalised.get(host)
+        if until is None:
+            return False
+        return (time.monotonic() if now is None else now) < until
+
+    def penalise(self, host: str, seconds: float = COOLDOWN) -> int:
+        """Halve this host's cap. Returns the new cap.
+
+        Halving rather than dropping to one is deliberate: a single 429 often
+        means "a bit slower", and going straight to one transfer would waste a
+        fast line on a board that merely dislikes bursts.
+        """
+        cap = max(1, self.host_cap(host) // 2)
+        self._host_cap[host] = cap
+        self._penalised[host] = time.monotonic() + seconds
+        return cap
+
+    def relax(self, host: str, step: int = 1) -> bool:
+        """Give a previously penalised host back one place after it behaves."""
+        if self.penalised(host):
+            return False
+        current = self._host_cap.get(host)
+        if current is None or current >= self._limit:
+            return False
+        self._host_cap[host] = min(self._limit, current + max(1, step))
+        if self._host_cap[host] >= self._limit:
+            self._host_cap.pop(host, None)
+            self._penalised.pop(host, None)
+        return True
+
+    async def set_limit(self, target: int, *, notify: bool = True) -> bool:
+        """Move the budget to *target* (clamped) and wake the waiters."""
+        target = max(self._floor, min(self._ceiling, target))
+        if target == self._limit:
+            return False
+        self._limit = target
+        if notify:
+            async with self._cond:
+                self._cond.notify_all()
+        return True
+
+    async def acquire(self, host: str = "") -> None:
+        async with self._cond:
+            while True:
+                if self._in_flight < self._limit and self._host_used.get(host, 0) < self.host_cap(host):
+                    self._in_flight += 1
+                    self._host_used[host] = self._host_used.get(host, 0) + 1
+                    return
+                await self._cond.wait()
+
+    async def release(self, host: str = "") -> None:
+        async with self._cond:
+            self._in_flight = max(0, self._in_flight - 1)
+            if host in self._host_used:
+                self._host_used[host] = max(0, self._host_used[host] - 1)
+            self._cond.notify_all()
+
+    def throttled_hosts(self) -> list[str]:
+        """Hosts currently serving a cooldown, for the adaptive loop to relax."""
+        return [host for host in self._penalised if self.penalised(host)]
+
+
+class _PoolGuard:
+    """Context manager that always gives its transfer place back.
+
+    ``AdaptivePool.acquire``/``release`` already take a host, but an ``async
+    with`` reads better at the call site and makes the release unconditional —
+    an exception between acquiring and releasing must not leak a place and
+    slowly starve the pool.
+    """
+
+    __slots__ = ("_host", "_pool")
+
+    def __init__(self, pool: AdaptivePool, host: str) -> None:
+        self._pool = pool
+        self._host = host
+
+    async def __aenter__(self) -> None:
+        await self._pool.acquire(self._host)
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self._pool.release(self._host)
+
+
 @dataclass(slots=True)
 class BatchStats:
     found: int = 0
@@ -380,7 +546,8 @@ class Downloader:
         db: Database,
         *,
         out_root: Path,
-        concurrency: int = 3,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        adaptive: bool = True,
         media_timeout: float = 600.0,
         proxy: str = "",
         force: bool = False,
@@ -398,7 +565,21 @@ class Downloader:
     ) -> None:
         self._db = db
         self._out_root = out_root
-        self._sem = asyncio.Semaphore(max(1, concurrency))
+        #: The starting pool is what the user asked for; the adaptive ramp may
+        #: widen it while the line is fast, and the floor keeps it from sinking
+        #: below a usable trickle.
+        self._requested_concurrency = max(1, concurrency)
+        self._adaptive = adaptive
+        self._pool = AdaptivePool(
+            self._requested_concurrency,
+            ceiling=self._pool_ceiling(),
+            floor=self._pool_floor(),
+        )
+        #: Bytes written since the last adaptive sample. Every transfer funnels
+        #: through ``_stream_to_file``, so this is the whole server's throughput
+        #: and not just one board's.
+        self._window_bytes = 0
+        self._window_start = time.monotonic()
         self._media_timeout = media_timeout
         self._proxy = proxy or None
         self._force = force
@@ -614,12 +795,19 @@ class Downloader:
             headers = dict(XBOORU_HEADERS)
             headers["Referer"] = f"{provider.base_url.rstrip('/')}/"
         last_error: Exception | None = None
+        host = AdaptivePool.host_key(post.file_url)
         for attempt in range(MAX_ATTEMPTS):
             try:
-                async with self._sem, self._session.get(post.file_url, headers=headers) as resp:  # type: ignore[union-attr]
+                async with self._pool_guard(host), self._session.get(post.file_url, headers=headers) as resp:  # type: ignore[union-attr]
                     if resp.status == 429:
                         pause = _retry_after(resp.headers.get("Retry-After"))
-                        self._warn("%s: rate limited, sleeping %.1fs", post.file_url, pause)
+                        cap = self._pool.penalise(host)
+                        self._warn(
+                            "%s: rate limited, backing off to %d parallel and sleeping %.1fs",
+                            host or post.file_url,
+                            cap,
+                            pause,
+                        )
                         await asyncio.sleep(pause)
                         continue
                     if resp.status == 404:
@@ -685,15 +873,83 @@ class Downloader:
                     )
             except (_RetryableError, TimeoutError, aiohttp.ClientError) as exc:
                 last_error = exc
+                # A timeout is the other signal that this host wants less
+                # pressure, so it earns the same cooldown as a 429.
+                cap = self._pool.penalise(host) if isinstance(exc, TimeoutError) else self._pool.host_cap(host)
                 self._warn(
-                    "%s: network error (%s), attempt %d/%d",
-                    post.file_url,
+                    "%s: network error (%s), attempt %d/%d (cap %d)",
+                    host or post.file_url,
                     exc,
                     attempt + 1,
                     MAX_ATTEMPTS,
+                    cap,
                 )
                 await asyncio.sleep(_backoff(attempt))
         return FAILED, str(last_error) if last_error else "net-error", None
+
+    def _pool_guard(self, host: str) -> _PoolGuard:
+        """Reserve a transfer place for *host*, releasing it on every exit path."""
+        return _PoolGuard(self._pool, host)
+
+    def _pool_ceiling(self) -> int:
+        """Highest pool size the adaptive ramp may reach for this run.
+
+        Bounded by what the user asked for times a headroom factor and by a hard
+        ceiling, so ``--concurrency 4`` never silently becomes twenty sockets.
+        """
+        if not self._adaptive:
+            return self._requested_concurrency
+        return min(MAX_POOL, max(self._requested_concurrency, int(self._requested_concurrency * ADAPTIVE_HEADROOM)))
+
+    def _pool_floor(self) -> int:
+        """Never below what the user asked for.
+
+        A slow patch at the start of a batch is not a reason to hand back
+        transfers the user explicitly requested; a board that is genuinely
+        unhappy is handled by its own per-host cap instead.
+        """
+        return self._requested_concurrency
+
+    async def _adapt_pool(self, speed: float, failures: int, previous_failures: int) -> None:
+        """Grow or shrink the pool from the throughput the last window saw.
+
+        Growing needs a genuinely fast line *and* a clean window; the pool only
+        ever comes back down to the requested size, so an over-eager ramp costs
+        a moment rather than a stalled batch.
+        """
+        if not self._adaptive:
+            return
+        if failures > previous_failures:
+            before = self._pool.limit
+            await self._pool.set_limit(max(self._pool_floor(), before - 2))
+            if self._pool.limit != before:
+                LOG.debug("adaptive: a transfer failed, pool %d -> %d", before, self._pool.limit)
+            return
+        if speed >= SCALE_UP_SPEED:
+            before = self._pool.limit
+            await self._pool.set_limit(min(self._pool_ceiling(), before + 2))
+            if self._pool.limit != before:
+                LOG.debug(
+                    "adaptive: %.1f MiB/s is fast enough, pool %d -> %d",
+                    speed / (1024 * 1024),
+                    before,
+                    self._pool.limit,
+                )
+        elif speed < SCALE_DOWN_SPEED:
+            # A quiet line does not need the extra places; step back towards
+            # the requested size, never past it.
+            before = self._pool.limit
+            await self._pool.set_limit(max(self._pool_floor(), before - 1))
+            if self._pool.limit != before:
+                LOG.debug(
+                    "adaptive: %.1f MiB/s is not saturating the line, pool %d -> %d",
+                    speed / (1024 * 1024),
+                    before,
+                    self._pool.limit,
+                )
+        else:
+            for host in self._pool.throttled_hosts():
+                self._pool.relax(host)
 
     async def _stream_to_file(
         self,
@@ -714,6 +970,7 @@ class Downloader:
                     digest.update(chunk)
                 if progress_task is not None and bar is not None:
                     bar.chunk(progress_task, len(chunk))
+                self._window_bytes += len(chunk)
                 if len(buffer) >= BUFFER_SIZE:
                     await handle.write(bytes(buffer))
                     buffer.clear()
@@ -832,6 +1089,22 @@ class Downloader:
         processed = downloaded_n = skipped_n = failed_n = duplicates_n = blocked_n = 0
         batch_meta: list[tuple] = []
 
+        async def monitor() -> None:
+            """Sample throughput every ADAPTIVE_INTERVAL and resize the pool."""
+            nonlocal failed_n
+            seen_failures = 0
+            while True:
+                await asyncio.sleep(ADAPTIVE_INTERVAL)
+                now = time.monotonic()
+                window = now - self._window_start
+                speed = self._window_bytes / window if window > 0 else 0.0
+                self._window_bytes = 0
+                self._window_start = now
+                if self._bar is not None:
+                    self._bar.adaptive_note(self._pool.limit, speed)
+                await self._adapt_pool(speed, failed_n, seen_failures)
+                seen_failures = failed_n
+
         async def worker(post: Post) -> tuple[str, str | None, tuple | None]:
             nonlocal processed, downloaded_n, skipped_n, failed_n, duplicates_n, blocked_n
             status, error, meta = await self.download_post(provider, post)
@@ -857,9 +1130,16 @@ class Downloader:
                 self._bar.update_aggregate(processed, downloaded_n, skipped_n, failed_n, duplicates_n, blocked_n)
             return status, error, meta
 
+        monitor_task = (
+            asyncio.create_task(monitor()) if self._adaptive and len(todo) > self._requested_concurrency else None
+        )
         try:
             results = await asyncio.gather(*(worker(post) for post in todo))
         finally:
+            if monitor_task is not None:
+                monitor_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await monitor_task
             if batch_meta:
                 await self._flush(batch_meta)
             if self._bar is not None:

@@ -1,6 +1,6 @@
 [project]
 name = "booru-dl"
-version = "2.1.0"
+version = "2.2.0"
 description = "Async batch downloader and sync tool for booru boards"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -13,7 +13,12 @@ Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
 ## Features
 
 - **Async streaming downloads** — `asyncio` + `aiohttp`, files streamed to disk
-  in chunks, concurrency bounded by `asyncio.Semaphore`.
+  in chunks, concurrency bounded by a resizable pool.
+- **Adaptive concurrency** — the pool starts at what you asked for (8 by
+  default), grows towards 20 while the line is genuinely delivering (above
+  ~20 MiB/s) and eases back when it is not. A board that answers `429 Too Many
+  Requests` or times out gets its own smaller cap, so one throttled host cannot
+  drag the healthy ones down. `--no-adaptive` pins the pool to a fixed size.
 - **Four-level deduplication** — `uid` in SQLite, the file already present on
   disk, an optional sha256 check, and a perceptual pHash so the same artwork
   reposted to another board under a new id is skipped too. The first three
@@ -120,9 +125,9 @@ custom `MIN:MAX` range, or no filter. `MIN:MAX` accepts `1.5:1.8`, `1,5:1,8`,
 
 The whole wizard is five screens and takes well under a minute: boards, the tag
 query, limit and geometry, an optional line of tags to exclude, then the
-summary. It never asks about concurrency — 8 parallel transfers keep a 100 Mbit
-line busy — and the JSON/sha256/re-download switches stay off unless you pass
-them to `dl` yourself.
+summary. It never asks about concurrency — it starts from the saved setting (or
+8) and the downloader tunes the pool to the measured speed from there. The
+JSON/sha256/re-download switches stay off unless you pass them to `dl` yourself.
 
 The wizard asks for the output folder only until one is known: the first answer
 is saved to the config and later runs reuse it silently, unless `BDL_OUT` is
@@ -133,9 +138,18 @@ database as you type, and the run ends with a summary before the final
 confirmation.
 
 Common flags for `dl` / `sync`: `--limit`, `--per-page`, `--out`,
-`--concurrency`, `--sidecar`, `--checksum`, `--force`, `--min-score`,
-`--rating-include`, `--max-size-mb`, `--blacklist`, `--no-progress`,
-`--no-preview`, `--no-notify`, `--timeout`.
+`--concurrency`, `--turbo`, `--no-adaptive`, `--sidecar`, `--checksum`,
+`--force`, `--min-score`, `--rating-include`, `--max-size-mb`, `--blacklist`,
+`--no-progress`, `--no-preview`, `--no-notify`, `--timeout`.
+
+Concurrency, in order of precedence:
+
+- `--turbo` — 20 parallel transfers, for fat (1–5 Gbit/s) pipes.
+- `--concurrency N` — an explicit pool size; clamped to 1–64.
+- `BDL_CONCURRENCY` — per-invocation override from the environment.
+- `bdl config set concurrency 16` — a saved default; `bdl config get
+  concurrency` prints what a run would actually use, and an unset setting
+  answers `8`.
 
 ## Directory layout
 
@@ -169,6 +183,7 @@ Environment variables:
 - `BDL_LOG_FILE` — duplicate logs to a file (`BOORU_DL_LOG_FILE` still works).
 - `BDL_LANG` — wizard language, `ru` (default) or `en`. Also settable through
   `bdl config set lang en`.
+- `BDL_CONCURRENCY` — parallel transfers for this run; beats the saved setting.
 - `PROXY_URL` — route requests through a proxy.
 
 ### Board blocks
@@ -181,6 +196,8 @@ reported once in the batch summary at the end. Setting `PROXY_URL` is the usual
 way out.
 - `bdl config set out ~/Pictures/booru` — default output root for every command
   that takes `--out` (`BDL_OUT` still wins over it).
+- `bdl config set concurrency 16` — default number of parallel transfers
+  (`--turbo`, `--concurrency` and `BDL_CONCURRENCY` still win over it).
 
 ## Development
 

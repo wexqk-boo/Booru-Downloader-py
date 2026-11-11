@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,17 @@ DEFAULT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 #: Name used under every XDG directory (config / data / cache / state).
 APP_DIR = "bdl"
+
+#: Parallel media transfers when neither config.json nor a flag says otherwise.
+#: 8 keeps a 100 Mbit line busy without opening a socket storm.
+DEFAULT_CONCURRENCY = 8
+
+#: ``--turbo`` and the ceiling the adaptive ramp may climb to: for the fat
+#: pipes (1-5 Gbit/s) where a small pool leaves the line idle.
+TURBO_CONCURRENCY = 20
+
+#: Hard cap, so a typo in config.json or a flag cannot open 10 000 sockets.
+MAX_CONCURRENCY = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +171,27 @@ def set_setting(name: str, value: str) -> None:
     save_config(values)
 
 
+#: Settings ``bdl config set`` accepts, with a validator and a short help line.
+#: Anything else is stored verbatim, which keeps the command useful for
+#: settings added later without a code change.
+_CONFIG_VALIDATORS: dict[str, Callable[[str], str | None]] = {}
+
+
+def _concurrency_validator(raw: str) -> str | None:
+    value = parse_concurrency(raw)
+    if value is None:
+        return f"concurrency must be a whole number between 1 and {MAX_CONCURRENCY}"
+    return None
+
+
+_CONFIG_VALIDATORS["concurrency"] = _concurrency_validator
+
+
+def config_validator(key: str) -> Callable[[str], str | None] | None:
+    """Return the checker for a config key, or None when it needs no checking."""
+    return _CONFIG_VALIDATORS.get(key)
+
+
 def default_out_dir() -> Path:
     """Default root folder: BDL_OUT, then config.json ``out``, then ~/Pictures/booru.
 
@@ -167,6 +200,39 @@ def default_out_dir() -> Path:
     """
     raw = env_first("BDL_OUT", "BOORU_DL_OUT") or get_setting("out").strip()
     return Path(raw).expanduser() if raw else Path.home() / "Pictures" / "booru"
+
+
+def clamp_concurrency(value: int) -> int:
+    """Keep a pool size inside sane bounds, whatever the source."""
+    return max(1, min(MAX_CONCURRENCY, value))
+
+
+def parse_concurrency(raw: str) -> int | None:
+    """Read a concurrency setting, or None when it is absent or unusable.
+
+    A bad value in config.json must not stop a download: the caller falls back
+    to the default and the user finds out through ``bdl config get``.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return clamp_concurrency(int(text))
+    except ValueError:
+        return None
+
+
+def default_concurrency() -> int:
+    """Pool size to start a run with: BDL_CONCURRENCY, config.json, then 8.
+
+    The environment wins because it is the per-invocation escape hatch, and the
+    saved setting is what ``bdl config set concurrency N`` writes.
+    """
+    from_env = parse_concurrency(env_first("BDL_CONCURRENCY"))
+    if from_env is not None:
+        return from_env
+    from_config = parse_concurrency(get_setting("concurrency"))
+    return from_config if from_config is not None else DEFAULT_CONCURRENCY
 
 
 @dataclass(frozen=True, slots=True)

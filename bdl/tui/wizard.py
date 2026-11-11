@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..blacklist import expand_tag, save_blacklist
-from ..config import default_out_dir, env_first, get_setting, set_setting
+from ..config import default_concurrency, default_out_dir, env_first, get_setting, set_setting
 from ..filters import AVATAR_ASPECT, WALLPAPER_ASPECT, parse_aspect_range
 from ..i18n import t
 from ..providers import ALL, PROVIDERS
@@ -40,8 +40,8 @@ _ORDER_OPTIONS: tuple[tuple[str, str], ...] = (
     ("top", "tui.order_top"),
 )
 
-#: 8 parallel transfers keep a 100 Mbit line busy without opening a socket
-#: storm, so the wizard no longer asks.
+#: Parallel transfers the wizard hands over when the user has not saved a
+#: preference. The pool then tunes itself to the measured line speed.
 DEFAULT_CONCURRENCY = 8
 
 _DEFAULT_LIMIT = 50
@@ -433,7 +433,7 @@ async def run_wizard(defaults: dict[str, Any] | None = None) -> dict[str, Any] |
             "limit": limit,
             "order": order,
             "out": out,
-            "concurrency": DEFAULT_CONCURRENCY,
+            "concurrency": default_concurrency(),
             "rating": rating,
             "aspect": aspect,
             "blacklist": blacklist,

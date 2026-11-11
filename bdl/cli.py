@@ -17,10 +17,16 @@ import aiohttp
 from . import __version__
 from .blacklist import add_tag, load_blacklist, remove_tag
 from .config import (
+    DEFAULT_CONCURRENCY,
+    TURBO_CONCURRENCY,
     ClientSettingsShim,
+    clamp_concurrency,
+    config_validator,
+    default_concurrency,
     default_db_path,
     default_out_dir,
     env_first,
+    get_setting,
     load_credentials,
     load_proxy,
     xdg_state_home,
@@ -91,7 +97,22 @@ def _add_batch_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=100, help="posts to fetch per source")
     parser.add_argument("--per-page", type=int, default=50, help="posts per API request")
     parser.add_argument("--out", type=Path, default=None, help="output root (one subfolder per source)")
-    parser.add_argument("--concurrency", type=int, default=3, help="parallel downloads")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help=f"parallel downloads (default: config, else {DEFAULT_CONCURRENCY})",
+    )
+    parser.add_argument(
+        "--turbo",
+        action="store_true",
+        help=f"shortcut for --concurrency {TURBO_CONCURRENCY} (fast 1-5 Gbit/s lines)",
+    )
+    parser.add_argument(
+        "--no-adaptive",
+        action="store_true",
+        help="keep the pool size fixed instead of tuning it to the measured speed",
+    )
     parser.add_argument("--order", choices=["", "top"], default="", help="'top' = best of the week")
     parser.add_argument("--force", action="store_true", help="re-download files already recorded")
     parser.add_argument("--sidecar", action="store_true", help="write post metadata as JSON next to the file")
@@ -386,6 +407,27 @@ def resolve_rating_set(args: argparse.Namespace) -> set[str] | None:
     return None
 
 
+def resolve_concurrency(args: argparse.Namespace) -> int:
+    """Pool size for this run: ``--turbo``, then ``--concurrency``, then config.
+
+    ``--turbo`` wins over a plain ``--concurrency`` because it is the more
+    specific request, and the value is clamped so a typo cannot open hundreds
+    of sockets.
+    """
+    turbo = bool(getattr(args, "turbo", False))
+    explicit = getattr(args, "concurrency", None)
+    if turbo and explicit is not None and explicit != TURBO_CONCURRENCY:
+        print(
+            f"warning: --turbo overrides --concurrency {explicit} (using {TURBO_CONCURRENCY})",
+            file=sys.stderr,
+        )
+    if turbo:
+        return TURBO_CONCURRENCY
+    if explicit is not None:
+        return clamp_concurrency(explicit)
+    return default_concurrency()
+
+
 def check_batch_args(args: argparse.Namespace) -> str | None:
     """Return a message when the batch flags contradict each other.
 
@@ -423,6 +465,7 @@ async def _execute_batch(args: argparse.Namespace, db: Database) -> tuple[dict[s
     creds = load_credentials(args.env_file)
     proxy = load_proxy(args.env_file)
     providers = resolve_sources(args.source)
+    args.concurrency = resolve_concurrency(args)
     args.tags = await _fixed_tags(args.tags)
     # The boards cannot filter by geometry, so width/height are checked locally.
     aspect_range = resolve_aspect_range(args)
@@ -467,6 +510,7 @@ async def _execute_batch(args: argparse.Namespace, db: Database) -> tuple[dict[s
             aspect_unknown=args.aspect_unknown,
             progress=not args.no_progress,
             preview=not args.no_preview,
+            adaptive=not args.no_adaptive,
         ) as downloader,
     ):
         for provider in providers:
@@ -596,7 +640,9 @@ async def cmd_tui(args: argparse.Namespace) -> int:
     args.tags = answers["tags"]
     args.limit = answers["limit"]
     args.out = answers.get("out") or args.out
-    args.concurrency = answers.get("concurrency") or args.concurrency
+    # The wizard's value comes from the saved setting; an explicit flag still wins.
+    if answers.get("concurrency") and args.concurrency is None and not args.turbo:
+        args.concurrency = answers["concurrency"]
     args.order = answers.get("order") or args.order
     options = answers.get("options") or {}
     args.sidecar = bool(options.get("sidecar"))
@@ -720,7 +766,7 @@ async def cmd_prune_stale(args: argparse.Namespace) -> int:
 
 
 async def cmd_config(args: argparse.Namespace) -> int:
-    from .config import get_setting, load_config, set_setting
+    from .config import load_config, set_setting
 
     if args.action == "show":
         values = load_config()
@@ -733,12 +779,27 @@ async def cmd_config(args: argparse.Namespace) -> int:
         if not args.key:
             print("Usage: bdl config get <key>", file=sys.stderr)
             return 2
-        print(get_setting(args.key))
+        stored = get_setting(args.key)
+        if args.key == "concurrency":
+            # Show the value a run would actually use: the environment can
+            # override the stored setting, and an unset key should still answer
+            # the question rather than print an empty line.
+            print(default_concurrency())
+        else:
+            print(stored)
         return 0
     if args.action == "set":
         if not args.key or args.value is None:
             print("Usage: bdl config set <key> <value>", file=sys.stderr)
             return 2
+        validator = config_validator(args.key)
+        if validator is not None:
+            error = validator(args.value)
+            if error:
+                print(error, file=sys.stderr)
+                return 2
+            if args.key == "concurrency":
+                args.value = str(clamp_concurrency(int(args.value)))
         set_setting(args.key, args.value)
         print(f"{args.key}={args.value}")
         return 0

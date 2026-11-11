@@ -1299,3 +1299,216 @@ def test_progress_rows_share_one_column_layout() -> None:
     # Different percentages and different speeds, identical geometry.
     assert "4%" in rows[0] and "67%" in rows[1]
     assert len({len(row) for row in rows}) == 1
+
+
+# Concurrency: config, flags and the adaptive pool
+def test_concurrency_setting_round_trips_through_config(tmp_path, monkeypatch) -> None:
+    """`bdl config set concurrency 16` must survive into the next run."""
+    from bdl import config
+
+    monkeypatch.setattr(config, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.delenv("BDL_CONCURRENCY", raising=False)
+    assert config.default_concurrency() == config.DEFAULT_CONCURRENCY == 8
+
+    config.set_setting("concurrency", "16")
+    assert config.get_setting("concurrency") == "16"
+    assert config.default_concurrency() == 16
+    # Persisted, not just cached: read the file back from disk.
+    assert json.loads((tmp_path / "config.json").read_text())["concurrency"] == "16"
+
+
+def test_concurrency_environment_wins_and_garbage_is_ignored(tmp_path, monkeypatch) -> None:
+    from bdl import config
+
+    monkeypatch.setattr(config, "config_path", lambda: tmp_path / "config.json")
+    config.set_setting("concurrency", "16")
+    monkeypatch.setenv("BDL_CONCURRENCY", "24")
+    assert config.default_concurrency() == 24
+
+    # A value nobody can parse must not break a download.
+    config.set_setting("concurrency", "banana")
+    monkeypatch.delenv("BDL_CONCURRENCY", raising=False)
+    assert config.default_concurrency() == config.DEFAULT_CONCURRENCY
+    # Nor may it escape the safe range.
+    assert config.clamp_concurrency(10_000) == config.MAX_CONCURRENCY
+    assert config.clamp_concurrency(0) == 1
+
+
+def test_turbo_flag_sets_twenty_transfers(tmp_path, monkeypatch) -> None:
+    from bdl import config
+    from bdl.cli import build_parser, resolve_concurrency
+
+    monkeypatch.setattr(config, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.delenv("BDL_CONCURRENCY", raising=False)
+    parser = build_parser()
+
+    plain = parser.parse_args(["dl", "-s", "gelbooru", "-t", "cat"])
+    assert resolve_concurrency(plain) == 8
+
+    turbo = parser.parse_args(["dl", "-s", "gelbooru", "-t", "cat", "--turbo"])
+    assert resolve_concurrency(turbo) == config.TURBO_CONCURRENCY == 20
+
+    explicit = parser.parse_args(["dl", "-s", "gelbooru", "-t", "cat", "--concurrency", "12"])
+    assert resolve_concurrency(explicit) == 12
+
+    # A saved preference is what a bare run uses.
+    config.set_setting("concurrency", "16")
+    assert resolve_concurrency(parser.parse_args(["dl", "-s", "gelbooru", "-t", "cat"])) == 16
+
+    # --turbo is the sharper instruction and wins, but the user is told.
+    both = parser.parse_args(["dl", "-s", "gelbooru", "-t", "cat", "--concurrency", "4", "--turbo"])
+    assert resolve_concurrency(both) == 20
+
+
+def test_adaptive_pool_starts_at_the_requested_size() -> None:
+    from bdl.downloader import AdaptivePool
+
+    pool = AdaptivePool(8, ceiling=20, floor=4)
+    assert pool.limit == 8
+    assert pool.in_flight == 0
+    assert AdaptivePool.host_key("https://img4.gelbooru.com/x/y.jpg") == "img4.gelbooru.com"
+
+
+def test_adaptive_pool_grows_and_shrinks_within_its_bounds() -> None:
+    from bdl.downloader import AdaptivePool
+
+    async def scenario() -> None:
+        pool = AdaptivePool(8, ceiling=20, floor=4)
+        await pool.set_limit(20)
+        assert pool.limit == 20
+        # The ceiling holds even if something asks for more.
+        await pool.set_limit(500)
+        assert pool.limit == 20
+        await pool.set_limit(1)
+        assert pool.limit == 4  # the floor keeps a usable trickle
+
+    asyncio.run(scenario())
+
+
+def test_adaptive_pool_penalises_only_the_host_that_failed() -> None:
+    """A throttled board must not slow down a healthy one."""
+    from bdl.downloader import AdaptivePool
+
+    async def scenario() -> None:
+        pool = AdaptivePool(8, ceiling=20, floor=4)
+        await pool.acquire("busy.example")
+        pool.penalise("busy.example", seconds=30)
+        assert pool.penalised("busy.example")
+        # Halved, not dropped to one: a single 429 usually means "slower".
+        assert pool.host_cap("busy.example") == 4
+        assert pool.host_cap("calm.example") == 8
+        await pool.release("busy.example")
+        assert pool.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_adaptive_pool_cooldown_expires_and_relaxes() -> None:
+    from bdl.downloader import AdaptivePool
+
+    async def scenario() -> None:
+        pool = AdaptivePool(8, ceiling=20, floor=4)
+        pool.penalise("slow.example", seconds=0.0)
+        assert not pool.penalised("slow.example")
+        pool.penalise("slow.example", seconds=30)
+        assert pool.relax("slow.example") is False  # still cooling down
+
+    asyncio.run(scenario())
+
+
+def test_adaptive_pool_blocks_a_penalised_host_beyond_its_cap() -> None:
+    """The per-host cap is enforced, not just reported."""
+    from bdl.downloader import AdaptivePool
+
+    async def scenario() -> None:
+        pool = AdaptivePool(4, ceiling=20, floor=2)
+        pool.penalise("tight.example", seconds=30)  # cap 4 -> 2
+        await pool.acquire("tight.example")
+        await pool.acquire("tight.example")
+        assert pool.host_cap("tight.example") == 2
+        third = asyncio.create_task(pool.acquire("tight.example"))
+        await asyncio.sleep(0.05)
+        assert not third.done()  # the cap holds it back
+        await pool.release("tight.example")
+        await asyncio.wait_for(third, timeout=1.0)
+        assert pool.in_flight == 2
+        for _ in range(2):
+            await pool.release("tight.example")
+
+    asyncio.run(scenario())
+
+
+def test_adaptive_pool_releases_a_place_on_every_exit_path() -> None:
+    """An exception inside the guarded block must not leak a slot."""
+    from bdl.downloader import AdaptivePool, _PoolGuard
+
+    async def scenario() -> None:
+        pool = AdaptivePool(2, ceiling=4, floor=1)
+        try:
+            async with _PoolGuard(pool, "host.example"):
+                raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+        assert pool.in_flight == 0
+        # Which means the pool is still usable afterwards.
+        async with _PoolGuard(pool, "host.example"):
+            assert pool.in_flight == 1
+        assert pool.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_downloader_adapts_the_pool_to_the_measured_speed() -> None:
+    """Hot line -> grow; cold line -> shrink; failures -> back off."""
+    from bdl.downloader import SCALE_DOWN_SPEED, SCALE_UP_SPEED, Downloader
+
+    downloader = Downloader(None, out_root=Path("/tmp/bdl-adaptive"), concurrency=8)  # type: ignore[arg-type]
+
+    async def scenario() -> None:
+        assert downloader._pool.limit == 8
+        # A gigabit line saturates the requested pool, so the ramp opens up.
+        await downloader._adapt_pool(SCALE_UP_SPEED * 1.5, failures=0, previous_failures=0)
+        assert downloader._pool.limit == 10
+        # It climbs towards the ceiling but stops there.
+        for _ in range(10):
+            await downloader._adapt_pool(SCALE_UP_SPEED * 2, failures=0, previous_failures=0)
+        assert downloader._pool.limit == downloader._pool_ceiling() <= 20
+        # The line goes quiet: the pool gives places back.
+        await downloader._adapt_pool(SCALE_DOWN_SPEED / 2, failures=0, previous_failures=0)
+        assert downloader._pool.limit < downloader._pool_ceiling()
+
+    asyncio.run(scenario())
+
+
+def test_downloader_never_adapts_when_adaptive_is_off() -> None:
+    from bdl.downloader import SCALE_UP_SPEED, Downloader
+
+    downloader = Downloader(  # type: ignore[arg-type]
+        None, out_root=Path("/tmp/bdl-adaptive"), concurrency=4, adaptive=False
+    )
+
+    async def scenario() -> None:
+        assert downloader._pool.limit == 4
+        await downloader._adapt_pool(SCALE_UP_SPEED * 10, failures=0, previous_failures=0)
+        assert downloader._pool.limit == 4
+        assert downloader._pool_ceiling() == 4
+
+    asyncio.run(scenario())
+
+
+def test_downloader_shrinks_the_pool_when_a_transfer_fails() -> None:
+    """A failing window walks the pool back, but not below the requested size."""
+    from bdl.downloader import Downloader
+
+    downloader = Downloader(None, out_root=Path("/tmp/bdl-adaptive"), concurrency=12)  # type: ignore[arg-type]
+
+    async def scenario() -> None:
+        await downloader._pool.set_limit(18)  # as if the ramp had opened up
+        await downloader._adapt_pool(speed=0.0, failures=1, previous_failures=0)
+        assert downloader._pool.limit == 16
+        # However bad it gets, the size the user asked for is the floor.
+        for _ in range(20):
+            await downloader._adapt_pool(speed=0.0, failures=1, previous_failures=0)
+        assert downloader._pool.limit == 12
+
+    asyncio.run(scenario())
