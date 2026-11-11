@@ -1,3 +1,6 @@
+[[https://img.shields.io/pypi/v/booru-dl?color=blue]](https://pypi.org/project/booru-dl/)
+[[https://img.shields.io/pypi/pyversions/booru-dl]](https://pypi.org/project/booru-dl/)
+
 # bdl
 
 Async batch downloader and sync tool for booru boards (Gelbooru, Rule34,
