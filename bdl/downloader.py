@@ -220,10 +220,7 @@ class _TransferDisplay(Progress):
         processed, listed = float(task.completed), float(task.total or 0)
         pct = min(processed / listed * 100, 100) if listed else 0.0
         filled, empty = _gauge(pct, gauge_width)
-        eta = ""
-        if self.planned_bytes > self.total_bytes and self.speed > 0:
-            eta = f"ETA {_fmt_duration((self.planned_bytes - self.total_bytes) / self.speed)}"
-        return Text.assemble(
+        line = Text.assemble(
             ("⠿ ", "cyan"),
             ("[", "grey37"),
             (filled, "cyan"),
@@ -235,13 +232,21 @@ class _TransferDisplay(Progress):
             (_cell(_fmt_bytes(self.total_bytes), _NUM_CELLS), "bold cyan"),
             (" │ ", "grey37"),
             (_speed_cell(self.speed), "cyan"),
-            "  ",
-            (_cell(eta, 15), "dim"),
-            "  ",
-            (str(task.fields.get("counts", "")), "green"),
-            "  ",
-            (_fmt_duration(task.elapsed), "dim"),
         )
+        # Only reserve the ETA column when there is an estimate to show: a
+        # padded empty cell would leave a visible hole in the middle of the row.
+        if self.planned_bytes > self.total_bytes and self.speed > 0:
+            remaining = (self.planned_bytes - self.total_bytes) / self.speed
+            line.append_text(Text.assemble("  ", (f"ETA {_fmt_duration(remaining)}", "dim")))
+        line.append_text(
+            Text.assemble(
+                "  ",
+                (str(task.fields.get("counts", "")), "green"),
+                "  ",
+                (_fmt_duration(task.elapsed), "dim"),
+            )
+        )
+        return line
 
 
 class TransferProgress:
