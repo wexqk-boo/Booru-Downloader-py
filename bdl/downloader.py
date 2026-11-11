@@ -27,7 +27,7 @@ from rich.console import RenderableType
 from rich.progress import Progress, Task
 from rich.text import Text
 
-from . import USER_AGENT, XBOORU_USER_AGENT, preview
+from . import USER_AGENT, XBOORU_HEADERS, preview
 from .db import Database
 from .filters import aspect_state
 from .media import SIDECAR_DIR, VIDEO_EXTENSIONS, media_paths, media_subdir, rating_bucket
@@ -47,12 +47,14 @@ BATCH_SIZE = 20
 DOWNLOADED = "downloaded"
 SKIPPED = "skipped"
 DUPLICATE = "duplicate"
+BLOCKED = "blocked"
 FAILED = "failed"
 
 # Re-exported so callers that used the old layout module keep working.
 VIDEO_EXTS = VIDEO_EXTENSIONS
 __all__ = [
     "BATCH_SIZE",
+    "BLOCKED",
     "DOWNLOADED",
     "DUPLICATE",
     "FAILED",
@@ -120,6 +122,32 @@ def _pad(text: str, width: int) -> str:
     return clipped + " " * max(0, width - cell_len(clipped))
 
 
+#: Cells the file gauge occupies, and the width of every numeric column.
+#: Numbers changing length are what makes plain progress rows dance: "4%" and
+#: "66%", "245 KiB" and "12 MiB" shift everything to their right, so the bars
+#: of neighbouring rows stop lining up and the display looks like a staircase.
+_BAR_CELLS = 13
+_NUM_CELLS = 10
+_SPEED_CELLS = 12
+_COUNTER_CELLS = 10
+
+
+def _cell(text: str, width: int) -> str:
+    """Right-align *text* in a fixed cell, clipping rather than overflowing."""
+    if cell_len(text) >= width:
+        return _clip(text, width)
+    return " " * (width - cell_len(text)) + text
+
+
+def _num(n: int | float) -> str:
+    """A byte figure padded to a fixed width, keeping the unit right-aligned."""
+    return _cell(_fmt_bytes(n), _NUM_CELLS)
+
+
+def _speed_cell(bps: float) -> str:
+    return _cell(_fmt_speed(bps), _SPEED_CELLS)
+
+
 class _TransferDisplay(Progress):
     """Progress that draws every row as one hard-clipped line.
 
@@ -154,42 +182,61 @@ class _TransferDisplay(Progress):
         yield Text("\n").join(lines) if lines else Text("")
 
     def _file_line(self, task: Task, width: int) -> Text:
-        total = _fmt_bytes(task.total) if task.total else "?"
-        pct = min(task.completed / task.total * 100, 100) if task.total else 0.0
-        bar_width = 18
-        filled, empty = _gauge(pct, bar_width)
-        speed = _fmt_speed(float(task.fields.get("speed", 0.0)))
-        tail = f" {pct:>3.0f}%  {_fmt_bytes(task.completed)}/{total}  {speed}"
-        prefix = f"{_spinner()} "
-        name_width = max(12, width - cell_len(prefix) - bar_width - cell_len(tail) - 3)
+        """One compact row whose every column is a fixed width.
+
+        The layout is ``⠋ [━━━████░░░] 50% │ 1.2 MiB/s │ 4.5 / 12.0 MiB │ name``:
+        the gauge sits next to the percentage rather than being pushed to the
+        far right, and both numbers are padded, so rows never reflow as counts
+        grow and the left edge stays a single straight column.
+        """
+        total = float(task.total or 0)
+        pct = min(task.completed / total * 100, 100) if total else 0.0
+        filled, empty = _gauge(pct, _BAR_CELLS)
+        sizes = f"{_num(task.completed)} / {_num(total)}"
+        # spinner "⠋ " + "[gauge] " + "NN%" + two " │ " separators + speed cells
+        # + the two size cells + the final separator; everything else goes to
+        # the file name.
+        fixed = 2 + (_BAR_CELLS + 3) + 4 + 3 + _SPEED_CELLS + 3 + cell_len(sizes) + 3
+        name_width = max(8, width - fixed)
         return Text.assemble(
-            (prefix, "cyan"),
-            (_pad(str(task.description), name_width), ""),
-            "  ",
+            (_spinner() + " ", "cyan"),
+            ("[", "grey37"),
             (filled, "cyan"),
             (empty, "grey37"),
-            (tail, "cyan" if pct >= 100 else ""),
+            ("]", "grey37"),
+            " ",
+            (f"{pct:>3.0f}%", "cyan" if pct >= 100 else ""),
+            (" │ ", "grey37"),
+            (_speed_cell(float(task.fields.get("speed", 0.0))), ""),
+            (" │ ", "grey37"),
+            (sizes, ""),
+            (" │ ", "grey37"),
+            (_pad(str(task.description), name_width), "cyan" if pct >= 100 else ""),
         )
 
     def _aggregate_line(self, task: Task, width: int) -> Text:
+        """The totals row: same columns, plus counts and elapsed time."""
+        gauge_width = max(8, min(20, width // 5))
+        processed, listed = float(task.completed), float(task.total or 0)
+        pct = min(processed / listed * 100, 100) if listed else 0.0
+        filled, empty = _gauge(pct, gauge_width)
         eta = ""
         if self.planned_bytes > self.total_bytes and self.speed > 0:
-            eta = f"  ETA {_fmt_duration((self.planned_bytes - self.total_bytes) / self.speed)}"
-        counter = f"{int(task.completed)} / {int(task.total or 0)}"
-        gauge_width = max(8, min(24, width // 4))
-        pct = min(task.completed / task.total * 100, 100) if task.total else 0.0
-        filled, empty = _gauge(pct, gauge_width)
+            eta = f"ETA {_fmt_duration((self.planned_bytes - self.total_bytes) / self.speed)}"
         return Text.assemble(
             ("⠿ ", "cyan"),
+            ("[", "grey37"),
             (filled, "cyan"),
             (empty, "grey37"),
+            ("]", "grey37"),
+            " ",
+            (_cell(f"{int(processed)} / {int(listed)}", _COUNTER_CELLS), "bold"),
+            (" │ ", "grey37"),
+            (_cell(_fmt_bytes(self.total_bytes), _NUM_CELLS), "bold cyan"),
+            (" │ ", "grey37"),
+            (_speed_cell(self.speed), "cyan"),
             "  ",
-            (counter, "bold"),
-            "  ",
-            (_fmt_bytes(self.total_bytes), "bold cyan"),
-            "  ",
-            (_fmt_speed(self.speed), "cyan"),
-            (eta, "dim"),
+            (_cell(eta, 15), "dim"),
             "  ",
             (str(task.fields.get("counts", "")), "green"),
             "  ",
@@ -230,7 +277,15 @@ class TransferProgress:
         self._planned_bytes = max(0, total_bytes)
         self._progress.planned_bytes = self._planned_bytes
 
-    def update_aggregate(self, processed: int, downloaded: int, skipped: int, failed: int, duplicates: int = 0) -> None:
+    def update_aggregate(
+        self,
+        processed: int,
+        downloaded: int,
+        skipped: int,
+        failed: int,
+        duplicates: int = 0,
+        blocked: int = 0,
+    ) -> None:
         now = time.monotonic()
         if (window := now - self._w_start) >= 0.4:
             instant = self._w_bytes / window
@@ -241,6 +296,8 @@ class TransferProgress:
         counts = f"+{downloaded} ={skipped} x{failed}"
         if duplicates:
             counts += f" ~{duplicates}"
+        if blocked:
+            counts += f" !{blocked}"
         self._progress.update(
             self._agg_task,  # type: ignore[arg-type]
             completed=processed,
@@ -305,6 +362,8 @@ class BatchStats:
     skipped: int = 0
     #: Skipped because the picture is already in the library under another id.
     duplicates: int = 0
+    #: Refused with a 401/403 — a Cloudflare challenge or a missing key.
+    blocked: int = 0
     failed: int = 0
     unknown_aspect: int = 0
     failures: list[tuple[Post, str]] = field(default_factory=list)
@@ -518,15 +577,14 @@ class Downloader:
         self._preview_paths.append(path)
 
     def show_previews(self) -> None:
-        """Draw the queued thumbnails, when the terminal can show them."""
+        """Draw the queued thumbnails as one compact gallery."""
         paths, self._preview_paths = self._preview_paths, []
         if not paths or not preview.available():
             return
-        for path in paths:
-            try:
-                preview.show(path)
-            except (OSError, ValueError) as exc:
-                LOG.debug("preview failed for %s: %s", path, exc)
+        try:
+            preview.show_many(paths)
+        except (OSError, ValueError) as exc:
+            LOG.debug("previews failed: %s", exc)
 
     async def download_post(self, provider: Provider, post: Post) -> tuple[str, str | None, tuple | None]:
         """Download one post; returns ``(status, error, metadata_row)``."""
@@ -544,10 +602,12 @@ class Downloader:
             sidecar_dir.mkdir(parents=True, exist_ok=True)
 
         # Some boards reject hotlinks without a matching Referer, and Xbooru's
-        # Cloudflare edge challenges the plain tool User-Agent.
+        # Cloudflare edge challenges the plain tool User-Agent, so that one
+        # request goes out looking like a browser.
         headers = {"Referer": f"{provider.base_url.rstrip('/')}/"}
         if provider.key == "xbooru":
-            headers["User-Agent"] = XBOORU_USER_AGENT
+            headers = dict(XBOORU_HEADERS)
+            headers["Referer"] = f"{provider.base_url.rstrip('/')}/"
         last_error: Exception | None = None
         for attempt in range(MAX_ATTEMPTS):
             try:
@@ -561,6 +621,11 @@ class Downloader:
                         return FAILED, "404 — removed from the board", None
                     if resp.status >= 500:
                         raise _RetryableError(f"HTTP {resp.status}")
+                    if resp.status in (401, 403):
+                        # Cloudflare or a login wall, not a transient fault:
+                        # retrying would only draw more of the same. Counted
+                        # once in the summary instead of warned per file.
+                        return BLOCKED, f"HTTP {resp.status}", None
                     if resp.status >= 400:
                         return FAILED, f"HTTP {resp.status}", None
 
@@ -759,11 +824,11 @@ class Downloader:
             if self._bar is not None:
                 self._bar.set_planned(sum(post.file_size or 0 for post in todo))
 
-        processed = downloaded_n = skipped_n = failed_n = duplicates_n = 0
+        processed = downloaded_n = skipped_n = failed_n = duplicates_n = blocked_n = 0
         batch_meta: list[tuple] = []
 
         async def worker(post: Post) -> tuple[str, str | None, tuple | None]:
-            nonlocal processed, downloaded_n, skipped_n, failed_n, duplicates_n
+            nonlocal processed, downloaded_n, skipped_n, failed_n, duplicates_n, blocked_n
             status, error, meta = await self.download_post(provider, post)
             processed += 1
             if status == DOWNLOADED:
@@ -779,10 +844,12 @@ class Downloader:
                 skipped_n += 1
             elif status == DUPLICATE:
                 duplicates_n += 1
+            elif status == BLOCKED:
+                blocked_n += 1
             else:
                 failed_n += 1
             if self._bar is not None:
-                self._bar.update_aggregate(processed, downloaded_n, skipped_n, failed_n, duplicates_n)
+                self._bar.update_aggregate(processed, downloaded_n, skipped_n, failed_n, duplicates_n, blocked_n)
             return status, error, meta
 
         try:
@@ -805,6 +872,12 @@ class Downloader:
             elif status == DUPLICATE:
                 stats.skipped += 1
                 stats.duplicates += 1
+            elif status == BLOCKED:
+                # Not a per-file warning: a board answering every media request
+                # with 403 would otherwise fill the screen with them. Counted
+                # once, and explained in the summary.
+                stats.failed += 1
+                stats.blocked += 1
             else:
                 stats.failed += 1
                 stats.failures.append((post, error or "unknown"))

@@ -11,7 +11,7 @@ from typing import Any
 
 import aiohttp
 
-from .. import USER_AGENT, XBOORU_USER_AGENT
+from .. import USER_AGENT, XBOORU_HEADERS
 from ..models import Post
 from ..net.doh import DoHResolver
 from .base import Provider, ProviderError
@@ -58,11 +58,12 @@ class ProviderClient:
     def _headers_for(provider: Provider) -> dict[str, str]:
         """Per-board request headers.
 
-        Xbooru sits behind Cloudflare, which is quicker to challenge a client
-        that announces itself as a script than one that looks like a browser.
+        Xbooru's DAPI needs no key, but it sits behind Cloudflare, which is
+        quicker to challenge a client that announces itself as a script than
+        one that arrives with a browser's full header set.
         """
         if provider.key == "xbooru":
-            return {"User-Agent": XBOORU_USER_AGENT}
+            return dict(XBOORU_HEADERS)
         return {}
 
     async def close(self) -> None:

@@ -317,6 +317,11 @@ def _print_summary(all_stats: dict[str, BatchStats]) -> None:
         )
         if stats.duplicates:
             print(f"      {stats.duplicates} of the skipped posts were reposts of art already in the library")
+        if stats.blocked:
+            print(
+                f"      {stats.blocked} media requests were refused (HTTP 401/403) —"
+                " Cloudflare is challenging this IP; try PROXY_URL in .env"
+            )
         if stats.unknown_aspect:
             print(f"      kept {stats.unknown_aspect} without board dimensions")
         if stats.reported == 0:

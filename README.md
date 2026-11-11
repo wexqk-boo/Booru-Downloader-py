@@ -24,8 +24,9 @@ Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
   platform but Windows, which speeds up a batch of many small transfers.
 - **Typo tolerance** — a tag that is not in the dictionary is matched against
   the popular tags and corrected before the query goes out (`mku` → `miku`).
-- **Image previews** — inside Kitty, finished pictures are drawn as thumbnails
-  once the batch ends; `--no-preview` turns them off.
+- **Image previews** — inside Kitty, finished pictures are drawn once the batch
+  ends as a compact gallery of thumbnail rows rather than a column running off
+  the screen; `--no-preview` turns them off.
 - **Interactive wizard** — `bdl` on a terminal (or `bdl tui`) walks through the
   download: boards with checkboxes, tags with live tag suggestions, limit, sort
   order, rating, geometry and an optional list of tags to exclude, then prints a
@@ -155,6 +156,16 @@ Environment variables:
 - `BDL_LOG_FILE` — duplicate logs to a file (`BOORU_DL_LOG_FILE` still works).
 - `BDL_LANG` — wizard language, `ru` (default) or `en`. Also settable through
   `bdl config set lang en`.
+- `PROXY_URL` — route requests through a proxy.
+
+### Board blocks
+
+Xbooru's DAPI needs no API key, but Cloudflare fronts the site and sometimes
+challenges an IP with HTTP 403. Requests to Xbooru therefore carry a full set of
+browser headers. If the IP is still challenged, the affected files are counted
+as `blocked` instead of filling the screen with warnings, and the reason is
+reported once in the batch summary at the end. Setting `PROXY_URL` is the usual
+way out.
 - `bdl config set out ~/Pictures/booru` — default output root for every command
   that takes `--out` (`BDL_OUT` still wins over it).
 

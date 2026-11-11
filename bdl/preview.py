@@ -16,8 +16,22 @@ from pathlib import Path
 
 LOG = logging.getLogger(__name__)
 
-#: Rows of text a thumbnail is allowed to occupy.
-PREVIEW_ROWS = 12
+#: Rows of text one row of thumbnails is allowed to occupy.
+PREVIEW_ROWS = 8
+
+#: Thumbnails side by side in a row. Three keeps each tile readable without
+#: pushing the strip past a normal terminal width.
+PER_ROW = 3
+
+#: Rows of thumbnails in the gallery. A batch may download a hundred pictures;
+#: the gallery stays a small block at the bottom instead of a full-screen roll.
+MAX_TILE_ROWS = 2
+
+#: Pixels a single tile is scaled into, and the gap between tiles.
+TILE_WIDTH = 208
+_CELL_PIXELS = 16
+_TILE_GAP = 8
+_BACKGROUND = (0, 0, 0, 0)
 
 #: Escape sequence size limit; images are resized down before they get here.
 _CHUNK = 4096
@@ -45,8 +59,8 @@ def available() -> bool:
     return sys.stdout.isatty() and in_kitty()
 
 
-def _resize(path: Path, rows: int) -> bytes | None:
-    """Return PNG bytes for a thumbnail, or None when it cannot be built."""
+def _thumbnail(path: Path, rows: int) -> bytes | None:
+    """Return PNG bytes for one tile, or None when it cannot be built."""
     try:
         from PIL import Image
     except ImportError:
@@ -55,10 +69,13 @@ def _resize(path: Path, rows: int) -> bytes | None:
     try:
         image = Image.open(path)
         image.load()
-        # Terminal cells are about twice as tall as they are wide.
-        height = max(1, rows * 16)
-        width = max(1, round(image.width * height / image.height))
-        image = image.convert("RGBA").resize((min(width, 1200), height), Image.LANCZOS)
+        # Fit the picture inside one tile's box instead of stretching it to
+        # fill: previews exist to recognise a picture, and a squashed one is
+        # harder to recognise than a small one.
+        box_height = max(1, rows * _CELL_PIXELS)
+        scale = min(TILE_WIDTH / image.width, box_height / image.height)
+        size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        image = image.convert("RGBA").resize(size, Image.LANCZOS)
         if image.width <= 1 or image.height <= 1:
             return None
         from io import BytesIO
@@ -71,28 +88,91 @@ def _resize(path: Path, rows: int) -> bytes | None:
         return None
 
 
+def _strip(paths: list[Path], rows: int) -> tuple[bytes, int, int] | None:
+    """Compose a row of thumbnails into one PNG.
+
+    Returns the PNG bytes together with its pixel size, which the caller needs
+    to work out how many cells the row should occupy. One combined image means
+    one graphics payload for the whole row: sending a separate escape sequence
+    per tile makes Kitty lay them out in a column and scroll the terminal,
+    which is exactly what a preview should not do.
+    """
+    if not paths:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        LOG.debug("Pillow is missing; skipping preview")
+        return None
+
+    tiles: list[Image.Image] = []
+    for path in paths:
+        payload = _thumbnail(path, rows)
+        if payload is None:
+            continue
+        from io import BytesIO
+
+        tiles.append(Image.open(BytesIO(payload)))
+    if not tiles:
+        return None
+
+    height = max(tile.height for tile in tiles)
+    width = sum(tile.width for tile in tiles) + _TILE_GAP * (len(tiles) - 1)
+    strip = Image.new("RGBA", (width, height), _BACKGROUND)
+    offset = 0
+    for tile in tiles:
+        # Bottom-align the tiles so a short picture does not float.
+        strip.paste(tile, (offset, height - tile.height), tile)
+        offset += tile.width + _TILE_GAP
+    from io import BytesIO
+
+    buffer = BytesIO()
+    strip.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue(), strip.width, strip.height
+
+
+def show_many(paths: list[Path], rows: int = PREVIEW_ROWS, per_row: int = PER_ROW) -> int:
+    """Draw *paths* as a compact gallery of thumbnail rows.
+
+    At most ``MAX_TILE_ROWS`` rows are drawn, so a large batch leaves a neat
+    block at the bottom of the screen instead of a column running off it.
+    Returns how many rows were drawn.
+    """
+    if not available():
+        return 0
+    drawn = 0
+    for start in range(0, len(paths), per_row):
+        if drawn >= MAX_TILE_ROWS:
+            break
+        group = [path for path in paths[start : start + per_row] if path.is_file()]
+        composed = _strip(group, rows)
+        if composed is None:
+            continue
+        payload, width, height = composed
+        columns = columns_for(width, height, rows)
+        if _transmit(payload, rows, columns):
+            drawn += 1
+            continue
+        # The protocol was refused (an older Kitty, or a multiplexer in
+        # between); the icat kitten exists for exactly that case.
+        if _icat(payload, rows, columns):
+            drawn += 1
+    return drawn
+
+
 def show(path: Path, rows: int = PREVIEW_ROWS) -> bool:
-    """Draw *path* as a thumbnail. Returns True when something was drawn."""
-    if not available() or not path.is_file():
-        return False
-    payload = _resize(path, rows)
-    if not payload:
-        return False
-    if _transmit(payload, rows):
-        return True
-    # The protocol was refused (an older Kitty, or a multiplexer in between);
-    # the icat kitten is the fallback for exactly that case.
-    return _icat(path, rows)
+    """Draw *path* as a single thumbnail. Returns True when something was drawn."""
+    return show_many([path], rows) > 0
 
 
-def _transmit(payload: bytes, rows: int) -> bool:
+def _transmit(payload: bytes, rows: int, columns: int) -> bool:
     """Send PNG bytes straight to the terminal with the graphics protocol.
 
-    ``f=100`` means the data is PNG and ``a=T`` places it at the cursor in
-    ``c`` columns by ``r`` rows, so nothing has to be deleted afterwards.
+    ``f=100`` means the data is PNG and ``a=T`` places it at the cursor, so
+    nothing has to be deleted afterwards. The placement box is expressed in
+    cells; Kitty fits the picture inside it without distorting it.
     """
     encoded = base64.b64encode(payload).decode("ascii")
-    columns = max(4, min(40, round(rows * 2.4)))
     out = sys.stdout
     try:
         for index in range(0, len(encoded), _CHUNK):
@@ -110,23 +190,43 @@ def _transmit(payload: bytes, rows: int) -> bool:
     return True
 
 
-def _icat(path: Path, rows: int) -> bool:
+def _icat(payload: bytes, rows: int, columns: int) -> bool:
     """Older Kitty builds may still be reached through the icat kitten."""
     kitten = shutil.which("kitty")
     if kitten is None:
         return False
     import subprocess
+    import tempfile
 
-    columns = max(4, min(40, round(rows * 2.4)))
     try:
-        subprocess.run(
-            [kitten, "+kitten", "icat", "--place", f"{columns}x{rows}", str(path)],
-            check=False,
-            stdout=sys.stdout,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            handle.write(payload)
+            temporary = handle.name
+        try:
+            subprocess.run(
+                [kitten, "+kitten", "icat", "--place", f"{columns}x{rows}", temporary],
+                check=False,
+                stdout=sys.stdout,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         LOG.debug("icat preview failed: %s", exc)
         return False
+    sys.stdout.write("\n")
     return True
+
+
+def columns_for(width: int, height: int, rows: int) -> int:
+    """Cells a picture of *width*×*height* pixels needs to occupy *rows* rows.
+
+    A terminal cell is about twice as tall as it is wide, so if the picture is
+    given *rows* rows it has ``height / rows`` pixels per row, and a column is
+    half of that. Getting this right is what keeps the tile from being scaled
+    down into a corner of an oversized box.
+    """
+    if width <= 0 or height <= 0 or rows <= 0:
+        return 1
+    return max(1, min(200, round(width * rows * 2 / height)))

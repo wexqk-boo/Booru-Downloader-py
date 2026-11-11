@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -1144,6 +1145,10 @@ def test_xbooru_gets_a_browser_user_agent() -> None:
     headers = ProviderClient._headers_for(PROVIDERS["xbooru"])
     assert headers["User-Agent"] == XBOORU_USER_AGENT
     assert "Firefox" in headers["User-Agent"]
+    # Cloudflare weighs the whole header set, not just the agent.
+    assert headers["Referer"].startswith("https://xbooru.com/")
+    assert headers["Accept"].startswith("text/html")
+    assert headers["Accept-Language"] == "en-US,en;q=0.5"
     # Other boards keep the honest tool agent.
     assert ProviderClient._headers_for(PROVIDERS["gelbooru"]) == {}
 
@@ -1171,21 +1176,69 @@ def test_preview_detection_uses_the_kitty_environment() -> None:
 
 def test_preview_thumbnail_is_png_bytes(tmp_path) -> None:
     Image = pytest.importorskip("PIL.Image")
-    from bdl.preview import _resize
+    from bdl.preview import _thumbnail
 
     path = tmp_path / "shot.png"
     Image.new("RGB", (400, 200), (10, 200, 30)).save(path)
-    payload = _resize(path, rows=6)
+    payload = _thumbnail(path, rows=6)
     assert payload is not None
     assert payload.startswith(b"\x89PNG")
+    # Tiles are fitted inside the box, never stretched past it.
+    tile = Image.open(io.BytesIO(payload))
+    assert tile.height <= 6 * 16
+    assert tile.width <= 208
 
 
 def test_preview_skips_a_file_that_is_not_an_image(tmp_path) -> None:
-    from bdl.preview import _resize
+    from bdl.preview import _thumbnail
 
     broken = tmp_path / "not.png"
     broken.write_bytes(b"nope")
-    assert _resize(broken, rows=4) is None
+    assert _thumbnail(broken, rows=4) is None
+
+
+def test_preview_gallery_is_a_grid_not_a_column(tmp_path) -> None:
+    """A batch of eight pictures becomes two rows of three, not eight rows."""
+    Image = pytest.importorskip("PIL.Image")
+
+    from bdl import preview
+
+    paths = []
+    for index in range(8):
+        path = tmp_path / f"{index}.png"
+        Image.new("RGB", (900, 300), (index * 20, 40, 90)).save(path)
+        paths.append(path)
+
+    strips: list[tuple[int, int]] = []
+
+    def fake_transmit(payload: bytes, rows: int, columns: int) -> bool:
+        strips.append((rows, columns))
+        return True
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(preview, "available", lambda: True)
+    monkeypatch.setattr(preview, "_transmit", fake_transmit)
+    try:
+        drawn = preview.show_many(paths)
+    finally:
+        monkeypatch.undo()
+
+    assert drawn == preview.MAX_TILE_ROWS == 2
+    # One strip per gallery row, each three tiles wide and inside the box.
+    assert len(strips) == 2
+    for rows, columns in strips:
+        assert rows == preview.PREVIEW_ROWS
+        assert 1 <= columns <= 200
+
+
+def test_preview_columns_keep_the_picture_shape() -> None:
+    from bdl.preview import columns_for
+
+    # A 3:1 strip scaled to 8 rows is 48 cells wide: 8 rows * 2 (cells are
+    # twice as tall as wide) * 3 (the aspect ratio) / 1.
+    assert columns_for(1200, 400, 8) == 48
+    assert columns_for(0, 400, 8) == 1
+    assert columns_for(400, 400, 0) == 1
 
 
 def test_gauge_splits_the_bar_into_full_and_empty_cells() -> None:
@@ -1212,6 +1265,37 @@ def test_progress_file_row_has_a_gauge_and_a_spinner() -> None:
     row = lines[1]
     assert "█" in row and "━" in row
     assert "50%" in row
-    assert "512.0 B/1.0 KiB" in row
+    # The gauge sits next to the percentage, not pushed to the far right.
+    assert "50% │" in row
+    assert "512.0 B /    1.0 KiB" in row
     assert isinstance(bar._progress.get_renderables(), object)  # still one Text
     assert isinstance(next(iter(bar._progress.get_renderables())), Text)
+
+
+def test_progress_rows_share_one_column_layout() -> None:
+    """Every row lines up, whatever the numbers happen to be.
+
+    This is the regression guard for the "staircase": a four-percent bar and a
+    sixty-six-percent bar must start and end at the same cells.
+    """
+
+    from bdl.downloader import TransferProgress
+
+    bar = TransferProgress()
+    bar.start("Gelbooru", 2)
+    small = bar.begin_file("a.png", 245 * 1024)
+    large = bar.begin_file("b.png", 12 * 1024 * 1024)
+    bar.chunk(small, 10 * 1024)  # ~4%
+    bar.chunk(large, 8 * 1024 * 1024)  # ~66%
+    bar._progress.update(small, speed=900 * 1024)  # 4-char speed
+    bar._progress.update(large, speed=1.2 * 1024 * 1024)  # 9-char speed
+    rows = next(iter(bar._progress.get_renderables())).plain.split("\n")[1:]
+
+    def columns(row: str) -> list[int]:
+        return [row.index(mark) for mark in ("[", "]", "│", "│", "│")]
+
+    assert len(rows) == 2
+    assert columns(rows[0]) == columns(rows[1])
+    # Different percentages and different speeds, identical geometry.
+    assert "4%" in rows[0] and "67%" in rows[1]
+    assert len({len(row) for row in rows}) == 1
