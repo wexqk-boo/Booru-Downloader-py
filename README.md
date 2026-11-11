@@ -151,6 +151,22 @@ Concurrency, in order of precedence:
   concurrency` prints what a run would actually use, and an unset setting
   answers `8`.
 
+### Top of the week
+
+`--order top` (the wizard's "Top of the week") means "sort by score", and each
+board family spells that differently:
+
+- Moebooru (Konachan, Yande.re) sorts through a *tag*: the request carries
+  `order:score`. An `order=score` query argument is silently ignored by those
+  boards, and their `date:>=` filter returns nothing, so a tagged top is
+  honestly over all time.
+- For an untagged top those two boards use their own weekly listing
+  (`/post/popular_recent.json?period=1w`) — the closest thing Moebooru has to
+  "best of the week". It takes no tags and ignores paging, so it is only used
+  for the first page with an empty query, with a score search as the fallback.
+- Gelbooru-family boards use `sort=score:desc`; Danbooru sends
+  `search[order]=score`.
+
 ## Directory layout
 
 Files are written as `<out_root>/<source>/<bucket>/[videos/]/<filename>`, with

@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -133,24 +133,22 @@ class ProviderClient:
 
         creds = self._settings.credentials_for(provider_key)
         url = provider.build_url(tags, page, limit, creds, order)
+        # A bare "top" on a Moebooru board is best answered by its own weekly
+        # listing: that endpoint takes no tags, so it only fits when there are
+        # none, and it ignores paging, so only the first page can use it.
+        use_popular = page == 1 and order == "top" and not tags.strip() and bool(provider.popular_endpoint)
+        if use_popular:
+            url = provider.popular_url(creds)
         payload = await self._fetch_json(url, provider)
         raw_items = provider.raw_items(payload)
         posts = tuple(provider.parse(payload))
-        if page == 1 and order == "top" and provider.date_filter and not posts:
-            # Moebooru answers a rolling-week query with nothing when the tag
-            # saw no uploads in those seven days, which reads as "no results"
-            # rather than "nothing this week". Ask again over all time, keeping
-            # the score ordering.
-            fallback = replace(provider, date_filter=False)
-            LOG.info(
-                "%s: nothing in the last 7 days for %r; searching all time by score instead",
-                provider.title,
-                tags,
-            )
-            url = fallback.build_url(tags, page, limit, creds, order)
-            payload = await self._fetch_json(url, fallback)
-            raw_items = fallback.raw_items(payload)
-            posts = tuple(fallback.parse(payload))
+        if use_popular and not posts:
+            # The listing can be empty early in a week; the score-ordered
+            # search is still a sensible answer.
+            LOG.info("%s: the weekly listing is empty; falling back to a score search", provider.title)
+            payload = await self._fetch_json(provider.build_url(tags, page, limit, creds, order), provider)
+            raw_items = provider.raw_items(payload)
+            posts = tuple(provider.parse(payload))
         result = ProviderResult(
             provider=provider_key,
             posts=posts,

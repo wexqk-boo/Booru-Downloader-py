@@ -14,6 +14,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from .stdio import restore_blocking
+
 LOG = logging.getLogger(__name__)
 
 #: Rows of text one row of thumbnails is allowed to occupy.
@@ -140,6 +142,7 @@ def show_many(paths: list[Path], rows: int = PREVIEW_ROWS, per_row: int = PER_RO
     """
     if not available():
         return 0
+    restore_blocking()
     drawn = 0
     for start in range(0, len(paths), per_row):
         if drawn >= MAX_TILE_ROWS:
@@ -157,6 +160,9 @@ def show_many(paths: list[Path], rows: int = PREVIEW_ROWS, per_row: int = PER_RO
         # between); the icat kitten exists for exactly that case.
         if _icat(payload, rows, columns):
             drawn += 1
+    # A few hundred kilobytes of escape codes is exactly the write that lands
+    # on a non-blocking stream half-way through.
+    restore_blocking()
     return drawn
 
 

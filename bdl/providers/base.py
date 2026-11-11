@@ -9,7 +9,6 @@ Shapes:
 
 from __future__ import annotations
 
-import datetime
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus
@@ -19,12 +18,6 @@ from ..models import Post
 
 class ProviderError(RuntimeError):
     """The source is unreachable or returned an unexpected response."""
-
-
-def _top_tags(tags: str) -> str:
-    """Restrict the query to the last seven days."""
-    since = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
-    return f"{tags} date:>={since}" if tags else f"date:>={since}"
 
 
 def _absolute(base: str, value: str | None) -> str | None:
@@ -61,19 +54,38 @@ class Provider:
     key_required: bool = False
     page_param: str = "pid"
     page_base: int = 0
-    date_filter: bool = False  # whether the API accepts date: filters in tags
+    #: Moebooru boards expose the week's best work at their own endpoint. It
+    #: takes no tags and ignores paging, so it is only useful for a bare "top".
+    popular_endpoint: str = ""
 
     @property
     def label(self) -> str:
         return self.short or self.key
 
+    def popular_url(self, creds: dict[str, str]) -> str:
+        """URL of the board's own "best of the last week" listing, if it has one."""
+        url = self.popular_endpoint
+        api_key = creds.get("api_key", "").strip()
+        login = creds.get("login", "").strip()
+        if api_key and login:
+            separator = "&" if "?" in url else "?"
+            url += f"{separator}login={quote_plus(login)}&api_key={quote_plus(api_key)}"
+        return url
+
     # -- URL ----------------------------------------------------------------
     def build_url(self, tags: str, page: int, limit: int, creds: dict[str, str], order: str = "") -> str:
         sort_param = ""
         if order == "top":
-            if self.date_filter:
-                tags = _top_tags(tags)
-            sort_param = "&order=score" if self.kind == "moebooru" else "&sort=score:desc"
+            if self.kind == "moebooru":
+                # Moebooru sorts by score through a *tag* — ``order:score`` —
+                # and silently ignores an ``order=`` query argument (the same
+                # query returns unsorted posts with either). It also has no
+                # usable ``date:>=`` filter, so asking for a rolling week just
+                # returns nothing; the honest top is over all time, and the
+                # caller reaches for ``popular_endpoint`` when it wants a week.
+                tags = f"{tags} order:score" if tags else "order:score"
+            else:
+                sort_param = "&sort=score:desc"
 
         if self.kind == "moebooru":
             url = f"{self.endpoint}?tags={quote_plus(tags)}&page={max(page, 1)}&limit={limit}{sort_param}"

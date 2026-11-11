@@ -1512,3 +1512,137 @@ def test_downloader_shrinks_the_pool_when_a_transfer_fails() -> None:
         assert downloader._pool.limit == 12
 
     asyncio.run(scenario())
+
+
+# Moebooru "top": order:score is a tag, and the weekly listing covers no tags
+def test_moebooru_top_sorts_by_score_through_a_tag() -> None:
+    """`order=score` as a query argument does nothing on Moebooru.
+
+    The board only honours `order:score` inside the tag list, so a top query
+    must put it there — with or without the user's own tags.
+    """
+    provider = PROVIDERS["konachan"]
+    url = provider.build_url("hatsune_miku", 1, 50, {}, order="top")
+    assert "order%3Ascore" in url
+    assert "order=score" not in url  # the argument form is silently ignored
+    assert "date%3A" not in url  # Moebooru has no usable date filter
+
+    without_tags = provider.build_url("", 1, 50, {}, order="top")
+    assert "tags=order%3Ascore" in without_tags
+
+    # A plain (non-top) query must not smuggle the ordering in.
+    assert "order" not in provider.build_url("hatsune_miku", 1, 50, {})
+
+
+def test_moebooru_popular_endpoint_is_the_bare_top() -> None:
+    """Boards advertise their own weekly listing for an untagged top."""
+    konachan = PROVIDERS["konachan"]
+    assert konachan.popular_endpoint == "https://konachan.com/post/popular_recent.json?period=1w"
+    assert PROVIDERS["yandere"].popular_endpoint.endswith("/post/popular_recent.json?period=1w")
+    assert konachan.popular_url({}) == konachan.popular_endpoint
+    # Keys, when configured, are appended to the listing as well.
+    signed = konachan.popular_url({"login": "alice", "api_key": "KEY"})
+    assert "login=alice" in signed and "api_key=KEY" in signed
+    # Non-Moebooru boards are not touched by any of this.
+    assert PROVIDERS["gelbooru"].popular_endpoint == ""
+
+
+def test_bare_top_uses_the_popular_listing_only_without_tags() -> None:
+    """The listing takes no tags and ignores paging, so it fits page 1 only."""
+    from bdl.providers.client import ProviderClient
+
+    urls: list[str] = []
+
+    class _Settings:
+        cache_ttl = 0.0
+        max_cache_entries = 8
+
+        def credentials_for(self, key: str) -> dict[str, str]:
+            return {}
+
+    class _Client(ProviderClient):
+        async def _fetch_json(self, url: str, provider) -> object:  # type: ignore[override]
+            urls.append(url)
+            return []
+
+    async def scenario() -> None:
+        client = _Client(_Settings())  # type: ignore[arg-type]
+        konachan = PROVIDERS["konachan"]
+        await client.search_provider(konachan, "konachan", "", 1, 10, "top")
+        await client.search_provider(konachan, "konachan", "miku", 1, 10, "top")
+        await client.search_provider(konachan, "konachan", "", 2, 10, "top")
+
+    asyncio.run(scenario())
+    assert urls[0].startswith("https://konachan.com/post/popular_recent.json")
+    assert "order%3Ascore" in urls[1]
+    assert "popular_recent" not in urls[2]  # page 2 needs the real search
+    assert "order%3Ascore" in urls[2]
+
+
+def test_missing_result_from_the_popular_listing_falls_back() -> None:
+    """An empty weekly listing must not end the run with nothing."""
+    from bdl.providers.client import ProviderClient
+
+    urls: list[str] = []
+    calls = {"n": 0}
+
+    class _Settings:
+        cache_ttl = 0.0
+        max_cache_entries = 8
+
+        def credentials_for(self, key: str) -> dict[str, str]:
+            return {}
+
+    class _Client(ProviderClient):
+        async def _fetch_json(self, url: str, provider) -> object:  # type: ignore[override]
+            urls.append(url)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return []  # the weekly listing is empty
+            return [
+                {
+                    "id": 1,
+                    "tags": "miku",
+                    "file_url": "/image/a.png",
+                    "width": 100,
+                    "height": 100,
+                    "score": 5,
+                }
+            ]
+
+    async def scenario() -> int:
+        client = _Client(_Settings())  # type: ignore[arg-type]
+        result = await client.search_provider(PROVIDERS["konachan"], "konachan", "", 1, 10, "top")
+        return len(result.posts)
+
+    assert asyncio.run(scenario()) == 1
+    assert urls[0].startswith("https://konachan.com/post/popular_recent.json")
+    assert "order%3Ascore" in urls[1]
+
+
+# Console streams: a non-blocking stdout must not eat the summary
+def test_restore_blocking_survives_odd_streams(monkeypatch) -> None:
+    """`os.set_blocking` is best-effort: a captured stream has no fd to set."""
+    import io
+
+    from bdl import stdio
+
+    class _NoFileno(io.StringIO):
+        def fileno(self) -> int:
+            raise io.UnsupportedOperation("no descriptor")
+
+    monkeypatch.setattr(stdio.sys, "stdout", _NoFileno())
+    monkeypatch.setattr(stdio.sys, "stderr", _NoFileno())
+    stdio.restore_blocking()  # must not raise
+
+
+def test_restore_blocking_sets_the_flag_on_a_real_stream(tmp_path) -> None:
+    import os
+
+    from bdl import stdio
+
+    with open(tmp_path / "stream.txt", "w") as handle:
+        stdio.restore_blocking()
+        # A regular file is always blocking; the point is that the call is made
+        # and the stream is flushed rather than raising.
+        assert os.get_blocking(handle.fileno()) is True

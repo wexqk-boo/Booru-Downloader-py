@@ -51,7 +51,7 @@ BOT_PROVIDERS: dict[str, Provider] = {
         endpoint="https://konachan.com/post.json",
         kind="moebooru",
         auth_style="login",
-        date_filter=True,
+        popular_endpoint="https://konachan.com/post/popular_recent.json?period=1w",
     ),
     "yandere": Provider(
         key="yandere",
@@ -61,7 +61,7 @@ BOT_PROVIDERS: dict[str, Provider] = {
         endpoint="https://yande.re/post.json",
         kind="moebooru",
         auth_style="login",
-        date_filter=True,
+        popular_endpoint="https://yande.re/post/popular_recent.json?period=1w",
     ),
 }
 

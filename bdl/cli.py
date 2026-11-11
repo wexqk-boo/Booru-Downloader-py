@@ -38,6 +38,7 @@ from .media import NSFW_RATINGS, SAFE_RATINGS, SUGGESTIVE_RATINGS
 from .models import Post
 from .notifier import notify
 from .providers import ALL, PROVIDERS, CliProviderClient, ProviderError, resolve_sources
+from .stdio import restore_blocking
 
 LOG = logging.getLogger("bdl")
 SOURCE_CHOICES = [*sorted(PROVIDERS), ALL]
@@ -327,6 +328,7 @@ def _print_failed_providers(failed: list[str]) -> None:
 
 
 def _print_summary(all_stats: dict[str, BatchStats]) -> None:
+    restore_blocking()
     if not all_stats:
         print("Nothing downloaded: every source failed.")
         return
@@ -878,6 +880,7 @@ async def cmd_tags(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    restore_blocking()
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
     # Bare `bdl` opens the wizard, but only on a terminal: a script that
