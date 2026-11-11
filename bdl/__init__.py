@@ -4,7 +4,7 @@ Self-contained: own providers, DoH resolver, models, dedup database and tag
 dictionaries. Runs as ``python -m bdl`` or via the ``bdl`` console script.
 """
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 #: Repository the project is published from.
 REPO_SLUG = "github.com/wexqk-boo/Booru-Downloader-py"
