@@ -804,9 +804,16 @@ class Downloader:
             headers["Referer"] = f"{provider.base_url.rstrip('/')}/"
         last_error: Exception | None = None
         host = AdaptivePool.host_key(post.file_url)
-        for attempt in range(MAX_ATTEMPTS):
+        # Boards that do not report the file extension (zerochan) hand over a
+        # list of candidates; the real one is whichever answers 200. The list is
+        # walked on 404, while network errors and 5xx still retry the same URL.
+        candidates = (post.file_url, *post.alternate_urls)
+        cand_index = 0
+        attempt = 0
+        while attempt < MAX_ATTEMPTS:
+            url = candidates[cand_index]
             try:
-                async with self._pool_guard(host), self._session.get(post.file_url, headers=headers) as resp:  # type: ignore[union-attr]
+                async with self._pool_guard(host), self._session.get(url, headers=headers) as resp:  # type: ignore[union-attr]
                     if resp.status == 429:
                         pause = _retry_after(resp.headers.get("Retry-After"))
                         cap = self._pool.penalise(host)
@@ -880,6 +887,7 @@ class Downloader:
                         self._metadata_row(post, final_path, size, filename, sha256, phash),
                     )
             except (_RetryableError, TimeoutError, aiohttp.ClientError) as exc:
+                attempt += 1
                 last_error = exc
                 # A timeout is the other signal that this host wants less
                 # pressure, so it earns the same cooldown as a 429.
@@ -888,11 +896,11 @@ class Downloader:
                     "%s: network error (%s), attempt %d/%d (cap %d)",
                     host or post.file_url,
                     exc,
-                    attempt + 1,
+                    attempt,
                     MAX_ATTEMPTS,
                     cap,
                 )
-                await asyncio.sleep(_backoff(attempt))
+                await asyncio.sleep(_backoff(attempt - 1))
         return FAILED, str(last_error) if last_error else "net-error", None
 
     def _pool_guard(self, host: str) -> _PoolGuard:
