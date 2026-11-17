@@ -321,6 +321,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_tags)
 
     sp = sub.add_parser(
+        "migrate-layout",
+        parents=[_common_parser()],
+        help="move an old <source>/<rating> library into the wallpapers/avatars layout",
+        conflict_handler="resolve",
+    )
+    sp.add_argument("--dry-run", action="store_true", help="report only, move nothing")
+    sp.add_argument("--out", default=None, help="library root (default: the configured output folder)")
+    sp.add_argument("--json", action="store_true", help="machine readable output")
+    sp.add_argument("--keep-empty", action="store_true", help="leave the emptied source folders in place")
+    sp.set_defaults(func=cmd_migrate_layout)
+
+    sp = sub.add_parser(
         "tui", parents=[_common_parser()], help="interactive wizard (questionary)", conflict_handler="resolve"
     )
     _add_batch_args(sp)
@@ -854,6 +866,79 @@ async def cmd_prune_stale(args: argparse.Namespace) -> int:
     for source, count in sorted(result.items()):
         print(f"  {source}: {count}")
     return 0
+
+
+async def cmd_migrate_layout(args: argparse.Namespace) -> int:
+    """Move an old ``<source>/<rating>`` library into the current layout.
+
+    Each still is classified by its own pixels; a film needs no measurement
+    because every film goes to ``videos/``. The recorded ``file_path`` values
+    follow the files, which is what keeps ``sync`` from re-downloading the whole
+    library afterwards.
+    """
+    from . import migrate
+
+    out_root = Path(args.out).expanduser() if args.out else default_out_dir()
+    if not out_root.is_dir():
+        message = f"nothing to migrate: {out_root} is not a directory"
+        print(jsonlib.dumps({"error": message}) if args.json else message, file=sys.stderr)
+        return 2
+
+    db = Database(args.db or default_db_path())
+    await db.open()
+    try:
+        rows = await db.recorded_paths()
+        plan = migrate.build_plan(out_root)
+        result = migrate.apply_plan(plan, dry_run=args.dry_run)
+
+        # Only rows the plan actually moved need rewriting; anything else keeps
+        # whatever path it had.
+        path_by_name = {move.source_path.name: str(move.target_path) for move in result.moved}
+        updates = [
+            (uid, path_by_name[Path(file_path).name])
+            for uid, file_path in rows
+            if file_path and Path(file_path).name in path_by_name
+        ]
+        rewritten = 0 if args.dry_run else await db.update_paths(updates)
+
+        removed = [] if args.keep_empty else migrate.prune_empty_dirs(out_root, dry_run=args.dry_run)
+    finally:
+        await db.close()
+
+    summary = {
+        "root": str(out_root),
+        "dry_run": bool(args.dry_run),
+        "planned": plan.total,
+        "moved": result.moved_count,
+        "failed": len(result.failed),
+        "conflicts": len(plan.conflicts),
+        "skipped": len(plan.skipped),
+        "buckets": plan.counts(),
+        "db_rows_updated": rewritten,
+        "empty_dirs_removed": len(removed),
+    }
+    if args.json:
+        print(jsonlib.dumps(summary, ensure_ascii=False, indent=2))
+        return 0 if not result.failed else 1
+
+    verb = "would move" if args.dry_run else "moved"
+    print(f"Layout migration{' (dry run)' if args.dry_run else ''}: {verb} {result.moved_count} of {plan.total} files")
+    for bucket, count in plan.counts().items():
+        print(f"  {bucket}: {count}")
+    if rewritten:
+        print(f"  database rows updated: {rewritten}")
+    if removed:
+        print(f"  empty folders removed: {len(removed)}")
+    for source, reason in plan.skipped[:5]:
+        print(f"  skipped {source.name} ({reason})")
+    for move, error in result.failed[:5]:
+        print(f"  failed {move.source_path} -> {move.target_path}: {error}", file=sys.stderr)
+    if plan.conflicts:
+        print(
+            f"  {len(plan.conflicts)} file(s) left in place: the destination already exists",
+            file=sys.stderr,
+        )
+    return 0 if not result.failed else 1
 
 
 async def cmd_config(args: argparse.Namespace) -> int:
