@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .providers import PROVIDERS
+from .providers import CREDENTIAL_PREFIXES, PROVIDERS
 
 DEFAULT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
@@ -86,13 +86,23 @@ def _env_or_dotenv(name: str, dotenv: dict[str, str]) -> str:
     return (value or dotenv.get(name, "")).strip()
 
 
+def credential_prefix(key: str) -> str:
+    """The ``.env`` prefix a provider's credentials live under.
+
+    Usually the upper-cased key, but a dotted name such as ``konachan.net``
+    would look for ``KONACHAN.NET_API_KEY`` — a variable nobody writes. The
+    alias table spells those out as ``KONACHAN_NET_API_KEY``.
+    """
+    return CREDENTIAL_PREFIXES.get(key, key.upper())
+
+
 def load_credentials(env_file: str | Path | None = None) -> dict[str, ProviderCredentials]:
     """Read .env (or the real environment) and collect credentials per provider."""
     path = Path(env_file).expanduser() if env_file else DEFAULT_ENV_FILE
     dotenv = load_dotenv(path)
     credentials: dict[str, ProviderCredentials] = {}
     for key in PROVIDERS:
-        prefix = key.upper()
+        prefix = credential_prefix(key)
         credentials[key] = ProviderCredentials(
             api_key=_env_or_dotenv(f"{prefix}_API_KEY", dotenv),
             user_id=_env_or_dotenv(f"{prefix}_USER_ID", dotenv),

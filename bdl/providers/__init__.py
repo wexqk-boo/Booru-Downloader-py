@@ -1,7 +1,8 @@
 """Sources for the CLI — a self-contained registry.
 
 Gelbooru, rule34, xbooru, safebooru, danbooru, konachan and yandere are the
-base sources. Tbib, e621, e926 and konachan.net were added separately.
+base sources. Tbib, e621, e926, konachan.net, sakugabooru and
+zerochan were added separately.
 """
 
 from __future__ import annotations
@@ -11,6 +12,18 @@ from urllib.parse import quote_plus
 from ..models import Post
 from .base import Provider, ProviderError, _absolute, _to_int
 from .client import ProviderClient, ProviderResult
+
+#: Boards whose key is spelled without the dot in their registry name, so
+#: ``konachan.net`` can still read ``KONACHAN_NET_API_KEY``. Without this the
+#: credentials loader looked for ``KONACHAN.NET_API_KEY`` and silently found
+#: nothing — the board was queried anonymously while the user's key sat unused.
+CREDENTIAL_PREFIXES: dict[str, str] = {
+    "konachan.net": "KONACHAN_NET",
+}
+
+#: Zerochan asks that a client identify itself with a project name and, for
+#: rate-limit purposes, an account. See https://www.zerochan.net/api.
+ZEROCHAN_USER_AGENT = "bdl/2.2.2 (+https://github.com/wexqk-boo/Booru-Downloader-py)"
 
 # base sources (gelbooru family + moebooru)
 BOT_PROVIDERS: dict[str, Provider] = {
@@ -203,6 +216,34 @@ PROVIDERS["konachan.net"] = Provider(
     endpoint="https://konachan.net/post.json",
     kind="moebooru",
     auth_style="login",
+    popular_endpoint="https://konachan.net/post/popular_recent.json?period=1w",
+)
+PROVIDERS["sakugabooru"] = Provider(
+    key="sakugabooru",
+    short="Sakugabooru",
+    title="Sakugabooru 🎬",
+    base_url="https://www.sakugabooru.com",
+    endpoint="https://www.sakugabooru.com/post.json",
+    kind="moebooru",
+    auth_style="login",
+    popular_endpoint="https://www.sakugabooru.com/post/popular_recent.json?period=1w",
+)
+PROVIDERS["zerochan"] = Provider(
+    key="zerochan",
+    short="Zerochan",
+    title="Zerochan 🍥",
+    base_url="https://www.zerochan.net",
+    endpoint="https://www.zerochan.net",
+    kind="zerochan",
+    auth_style="none",
+    # The site answers a normal listing with HTTP 500 and a payload that is not
+    # strictly valid JSON, so both the status and the parser have to bend.
+    extra_ok_statuses=frozenset({500}),
+    headers=(
+        ("User-Agent", ZEROCHAN_USER_AGENT),
+        ("Accept", "application/json, text/plain, */*"),
+        ("Referer", "https://www.zerochan.net/"),
+    ),
 )
 
 ALL = "all"
@@ -243,4 +284,13 @@ class CliProviderClient(ProviderClient):
         return await self.search_provider(provider, provider_key, tags, page, limit, order)
 
 
-__all__ = ["ALL", "PROVIDERS", "TBIB", "CliProviderClient", "E621Provider", "resolve_sources"]
+__all__ = [
+    "ALL",
+    "CREDENTIAL_PREFIXES",
+    "PROVIDERS",
+    "TBIB",
+    "ZEROCHAN_USER_AGENT",
+    "CliProviderClient",
+    "E621Provider",
+    "resolve_sources",
+]
