@@ -11,14 +11,22 @@ from typing import Any
 from ..i18n import t
 
 #: Palette applied to every prompt. One definition keeps the screens
-#: consistent: cyan accents, pink pointer, green for what stays selected.
+#: consistent: cyan accents, pink pointer, muted green for what stays selected.
+#:
+#: ``noreverse`` is not decoration. questionary hands the pointed row the
+#: ``class:selected`` style, and prompt_toolkit's own default theme renders
+#: ``selected`` as ``reverse``. Merging the two turned this palette's green
+#: *foreground* into a green *background* across the whole row — the acid-green
+#: bar this file exists to avoid. Every class that can inherit that ``reverse``
+#: now switches it off and pins a plain background, so the highlight is carried
+#: by the text colour alone.
 _COLORS: tuple[tuple[str, str], ...] = (
     ("qmark", "fg:#00afff bold"),
     ("question", "bold"),
     ("answer", "fg:#00afff bold"),
-    ("pointer", "fg:#ff5f87 bold"),
-    ("highlighted", "fg:#ff5f87 bold"),
-    ("selected", "fg:#5faf5f"),
+    ("pointer", "noreverse fg:#ff5f87 bold"),
+    ("highlighted", "noreverse bg:default fg:#ff5f87 bold"),
+    ("selected", "noreverse bg:default fg:#87af87"),
     ("separator", "fg:#6c6c6c"),
     ("instruction", "fg:#808080 italic"),
     ("disabled", "fg:#6c6c6c italic"),
