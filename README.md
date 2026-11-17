@@ -29,7 +29,15 @@ Xbooru, Safebooru, Danbooru, Konachan, Yande.re, Tbib, e621, e926).
   downloaded. Boards that omit image dimensions are kept by default; pass
   `--aspect-unknown skip` to drop them instead.
 - **Tag-family blacklist** — a root tag pulls in its related sub-tags from
-  `~/.config/bdl/blacklist.txt`, plus a per-run `--blacklist` override.
+  `~/.config/bdl/blacklist.json`, plus a per-run `--blacklist` override. The tags
+  bdl ships with are built in and cannot be edited away; the file holds only
+  your own additions.
+  Matching is component-wise, so `ai` also blocks `ai_artwork` and
+  `ai_generated_v2`, but not `airplane`.
+- **AI-art filter** — a built-in list of generator tags (Stable Diffusion,
+  NovelAI, NAI, Midjourney, DALL·E, ComfyUI and the `ai_*` family) is skipped
+  by default, because the boards apply it inconsistently. `--no-ai-filter`
+  keeps those posts.
 - **DNS-over-HTTPS and proxy support** — a built-in `DoHResolver` (Cloudflare)
   works around local DNS blocks on image CDNs, and an upstream proxy can be set.
 - **uvloop when available** — the event loop switches to uvloop on every
@@ -100,17 +108,39 @@ bdl status
 bdl sync -s all -t "rating:general" --interval 900
 
 # Blacklist management
-bdl blacklist list
-bdl blacklist add loli
+bdl blacklist list                  # saved tags and built-in tags, separately
+bdl blacklist add loli scat         # a family such as `ai` expands on its own
+bdl blacklist remove loli
+bdl blacklist clear                 # the user's tags only; built-ins stay
 ```
 
 Other subcommands: `tui` (interactive wizard), `prune-stale` (forget DB rows
-whose files are gone), `config` (`get` / `set` / `show`), and `tags` (tag
+whose files are gone), `migrate-layout` (move an older library into the current
+folder layout), `config` (`get` / `set` / `show`), and `tags` (tag
 suggestions).
 
 `prune-stale` only inspects paths under the current output root, so a run
 against a temporary `--out` cannot forget the real library. Use `--all` to
 check every recorded path, or `--out DIR` to pick a different scope.
+
+### Migrating an older library
+
+`bdl migrate-layout` re-sorts a library written by an older version — the
+`<out_root>/<source>/<rating>/` tree — into the current layout. Each image is
+classified by its real aspect ratio (read with Pillow), every film is moved to
+the shared `videos/` root and sidecars to `json/`, and the recorded SQLite
+paths are rewritten to follow the files. Emptied source folders are removed.
+
+```bash
+bdl migrate-layout --dry-run    # print the plan, change nothing
+bdl migrate-layout              # perform it
+```
+
+`--dry-run` is safe to run at any time and reports exactly the moves a real run
+would make. Pair it with `--json` for a machine-readable summary, or
+`--keep-empty` to leave the old source folders in place. A move whose
+destination already exists is reported as a conflict rather than overwriting
+it, so nothing is lost.
 
 ### Wizard
 
@@ -140,7 +170,41 @@ confirmation.
 Common flags for `dl` / `sync`: `--limit`, `--per-page`, `--out`,
 `--concurrency`, `--turbo`, `--no-adaptive`, `--sidecar`, `--checksum`,
 `--force`, `--min-score`, `--rating-include`, `--max-size-mb`, `--blacklist`,
-`--no-progress`, `--no-preview`, `--no-notify`, `--timeout`.
+`--no-ai-filter`, `--no-tag-resolve`, `--no-progress`, `--no-preview`,
+`--no-notify`, `--timeout`.
+
+### Tag resolution
+
+Boards disagree about tags: `1girl` is spelled `Solo` on Zerochan and `female`
+on e621, an underscore is wrong where a space is right, and a border tag may be
+one of several aliases. Before each search bdl maps the tags you typed onto
+every selected board, using that board's own tag and alias API plus a small
+cross-engine table, and logs what it did:
+
+```
+tag mapping for zerochan:
+   1girl -> Solo  (board)
+tag mapping for yandere:
+   zzznope: not on this board
+```
+
+A tag a board does not have is reported, never silently dropped, and a board
+whose tag API is unreachable leaves the tag exactly as typed rather than
+hiding it. Answers are cached per board in `downloads.sqlite3` for seven days.
+Pass `--no-tag-resolve` to search with the tags exactly as typed.
+
+### The two blacklists
+
+bdl excludes two separate things. The **built-in** list is the generator tags
+(`ai`, `stable_diffusion`, `novelai`, …) and the like; it ships with the
+program, is always in effect, and cannot be edited away by accident. Your own
+exclusions live in `~/.config/bdl/blacklist.json` and are the only thing ever
+written. `bdl blacklist list` shows both under their own heading, and
+`bdl blacklist clear` empties only yours.
+
+In the wizard the exclusion step is a menu: use the saved list, add tags (and
+choose whether to keep them), remove tags from the saved list, or view the full
+list and come back to the same step.
 
 Concurrency, in order of precedence:
 
@@ -156,40 +220,64 @@ Concurrency, in order of precedence:
 `--order top` (the wizard's "Top of the week") means "sort by score", and each
 board family spells that differently:
 
-- Moebooru (Konachan, Yande.re) sorts through a *tag*: the request carries
-  `order:score`. An `order=score` query argument is silently ignored by those
-  boards, and their `date:>=` filter returns nothing, so a tagged top is
-  honestly over all time.
-- For an untagged top those two boards use their own weekly listing
+- Moebooru (Konachan, Yande.re, Sakugabooru) sorts through a *tag*: the request
+  carries `order:score`. An `order=score` query argument is silently ignored by
+  those boards, and their `date:>=` filter returns nothing, so a tagged top is
+  honestly over all time. These boards reject a query of more than six tags, so
+  `order:score` — and a `rating:` filter, which would cost another slot — is
+  only sent while there is room. Past that the six best tags go out alone and
+  the result is ranked by score locally (one page only, with a warning naming
+  how many tags were left out).
+- For an untagged top those boards use their own weekly listing
   (`/post/popular_recent.json?period=1w`) — the closest thing Moebooru has to
   "best of the week". It takes no tags and ignores paging, so it is only used
   for the first page with an empty query, with a score search as the fallback.
+- A tagged top that comes back empty falls back to the board's weekly listing,
+  and an empty weekly listing falls back to a score search. Some tags a board
+  still lists in its own tag API are not served through search at all
+  (`1girl` on Konachan returns zero posts while `long_hair` returns hundreds),
+  so without the fallback "top of the week" would report `found=0` for a query
+  the board plainly has material for. The fallback applies to `top` only — a
+  `newest` search is never quietly served a ranking — and never to deep pages,
+  because the listing cannot be paged.
 - Gelbooru-family boards use `sort=score:desc`; Danbooru sends
-  `search[order]=score`.
+  `search[order]=score`; Zerochan uses `s=fav`.
 
 ## Directory layout
 
-Files are written as `<out_root>/<source>/<bucket>/[videos/]/<filename>`, with
-all sidecar JSON collected in a `json/` folder:
+Files are written as `<out_root>/<wallpapers|avatars>/<bucket>/<filename>`, and
+every video goes to its own shared `<out_root>/videos/<bucket>/` root rather
+than into a shape folder. Sidecar JSON is collected in a `json/` folder beside
+the media it describes:
 
 ```
-<out_root>/<source>/
-├── safe/            # ratings: safe, s, general, g
-│   ├── <file>.jpg
-│   ├── videos/      # mp4, webm, mov, avi, mkv, flv, m4v, wmv
-│   └── json/        # <file>.jpg.json sidecars (with --sidecar)
-├── suggestive/      # ratings: questionable, q, sensitive
-└── nsfw/            # ratings: explicit, e
+<out_root>/
+├── wallpapers/      # aspect ratio 1.5–1.8 (16:9, 16:10)
+│   └── safe/        # ratings: safe, s, general, g
+│       ├── <file>.jpg
+│       └── json/    # <file>.jpg.json sidecars (with --sidecar)
+├── avatars/         # aspect ratio 0.6–1.05 (square, portrait)
+│   └── suggestive/  # ratings: questionable, q, sensitive
+│       └── json/
+├── videos/          # every mp4, webm, mov, avi, mkv, flv, m4v, wmv lands here
+│   └── safe/
+│       ├── <file>.mp4
+│       └── json/
+└── nsfw/            # shapes fitting neither window keep the rating here
 ```
 
-The default `out_root` comes from `BDL_OUT`, then the `out` key in the config
-file, then `~/Pictures/booru`. Unknown or missing ratings land in `nsfw/`.
+The shape folders come first, then the rating bucket; a file fitting neither
+aspect window stays directly under its rating at the root. A video is never
+judged by its shape, so a 16:9 clip is filed under `videos/`, not
+`wallpapers/`. The default `out_root` comes from `BDL_OUT`, then the `out` key
+in the config file, then `~/Pictures/booru`. Unknown or missing ratings land in
+`nsfw/`.
 
 ## Configuration
 
 - Config file: `~/.config/bdl/config.json`
 - Download state (SQLite): `~/.local/share/bdl/downloads.sqlite3`
-- Tag blacklist: `~/.config/bdl/blacklist.txt`
+- Tag blacklist: `~/.config/bdl/blacklist.json` (`bdl blacklist list|add|remove|clear`)
 - Tag database cache: `~/.cache/bdl/`
 - Log: `~/.local/state/bdl/bdl.log`
 
@@ -210,6 +298,28 @@ browser headers. If the IP is still challenged, the affected files are counted
 as `blocked` instead of filling the screen with warnings, and the reason is
 reported once in the batch summary at the end. Setting `PROXY_URL` is the usual
 way out.
+
+Zerochan needs a `User-Agent` naming the project (its [API
+rules](https://www.zerochan.net/api) ban anonymous clients), so those requests
+carry bdl's own. Its listing endpoint answers HTTP 500 even on success, and the
+body has a stray brace before the JSON, so the client treats 500 as expected
+there and parses the body leniently. Its tag spellings are redirects
+(`/1girl` answers `301` to `/Solo`), and the redirect drops the query string, so
+the client follows redirects by hand and carries `?json` and the pagination
+parameters onto the target — following them automatically would fetch an HTML
+page and fail to parse. Zerochan also does not say which extension
+a picture has: bdl tries `jpg`, then `png`, `webp`, `gif` against
+`static.zerochan.net`, using the same fallback for the media download.
+
+Realbooru is **not** supported: the site disabled its DAPI server-side, so the
+board could only ever answer with an error, and a source that cannot download
+anything does not belong in the list.
+
+Sakugabooru is a Moebooru board; `SAKUGABOORU_API_KEY` and
+`SAKUGABOORU_LOGIN` are optional and only widen what an anonymous request may
+see. Because the key is optional, a search that simply finds nothing says so
+instead of blaming credentials.
+
 - `bdl config set out ~/Pictures/booru` — default output root for every command
   that takes `--out` (`BDL_OUT` still wins over it).
 - `bdl config set concurrency 16` — default number of parallel transfers
