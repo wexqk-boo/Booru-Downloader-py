@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from bdl.blacklist import load_blacklist
+from bdl.blacklist import BUILTIN_TAGS, load_blacklist, load_user_blacklist, save_user_blacklist
 from bdl.config import get_setting
 from bdl.i18n import t
 from bdl.tui import wizard
@@ -24,6 +24,14 @@ from bdl.tui import wizard
 PROMPT_LOG: list[str] = []
 #: Free-form answers the scripted prompts return, keyed by prompt message.
 TEXT_ANSWERS: dict[str, str] = {}
+#: Entries to pick from the exclusion menu, keyed by the menu's heading. Each
+#: entry is consumed in turn, so a test can drive the menu's loop ("view", then
+#: settle on "use") without it spinning forever.
+SELECT_ANSWERS: dict[str, list[str]] = {}
+#: Values a scripted checkbox comes back with, keyed by prompt message.
+CHECKBOX_ANSWERS: dict[str, list[str]] = {}
+#: Answers a scripted confirm gives, keyed by prompt message.
+CONFIRM_ANSWERS: dict[str, bool] = {}
 
 
 class _FakeQuestion:
@@ -36,10 +44,15 @@ class _FakeQuestion:
     async def ask_async(self) -> Any:
         PROMPT_LOG.append(self.message)
         if self.kind == "confirm":
-            return True
+            return CONFIRM_ANSWERS.get(self.message, True)
         if self.kind == "checkbox":
+            if self.message in CHECKBOX_ANSWERS:
+                return list(CHECKBOX_ANSWERS[self.message])
             return list(self.values)
         if self.kind == "select":
+            for heading, queue in SELECT_ANSWERS.items():
+                if self.message.startswith(heading) and queue:
+                    return queue.pop(0)
             return self.kwargs["choices"][0].value
         if self.kind == "text":
             if self.message in TEXT_ANSWERS:
@@ -79,10 +92,12 @@ def scripted(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     PROMPT_LOG.clear()
     TEXT_ANSWERS.clear()
+    SELECT_ANSWERS.clear()
+    CHECKBOX_ANSWERS.clear()
+    CONFIRM_ANSWERS.clear()
 
 
 def test_wizard_collects_every_download_option(scripted: None) -> None:
-    TEXT_ANSWERS[t("tui.blacklist")] = "ai"
     answers = asyncio.run(wizard.run_wizard())
 
     assert answers is not None
@@ -93,18 +108,65 @@ def test_wizard_collects_every_download_option(scripted: None) -> None:
     assert answers["options"] == wizard.DEFAULT_OPTIONS
     assert answers["options"]["notify"] is True
     assert answers["options"]["sidecar"] is False
-    # A root expands into its whole family instead of a single tag.
-    assert "ai" in answers["blacklist"]
-    assert "ai_generated" in answers["blacklist"]
+    # The default menu entry hands back the built-in tags, so the protection
+    # is always on even when the user saves nothing of their own.
+    assert answers["blacklist"] == set(BUILTIN_TAGS)
     assert load_blacklist() == answers["blacklist"]
 
 
-def test_wizard_leaves_no_blacklist_when_the_field_is_empty(scripted: None) -> None:
+def test_wizard_keeps_saved_tags_when_the_default_entry_is_chosen(scripted: None) -> None:
+    """The old step wrote the file on every pass, so a re-run wiped it."""
+    save_user_blacklist({"guro"})
     answers = asyncio.run(wizard.run_wizard())
 
     assert answers is not None
-    assert answers["blacklist"] == set()
-    assert load_blacklist() == set()
+    assert "guro" in answers["blacklist"]
+    assert load_user_blacklist() == {"guro"}
+
+
+def test_wizard_can_add_tags_and_persist_them(scripted: None) -> None:
+    SELECT_ANSWERS[t("tui.blacklist")] = ["add", "use"]
+    TEXT_ANSWERS[t("tui.blacklist_add_prompt")] = "cat, furry"
+    answers = asyncio.run(wizard.run_wizard())
+
+    assert answers is not None
+    assert {"cat", "furry"} <= answers["blacklist"]
+    assert {"cat", "furry"} <= load_user_blacklist()
+
+
+def test_wizard_can_add_tags_for_one_run_only(scripted: None) -> None:
+    """Declining the save keeps the exclusion for this run but stores nothing."""
+    SELECT_ANSWERS[t("tui.blacklist")] = ["add", "use"]
+    TEXT_ANSWERS[t("tui.blacklist_add_prompt")] = "cat"
+    CONFIRM_ANSWERS[t("tui.blacklist_persist")] = False
+    answers = asyncio.run(wizard.run_wizard())
+
+    assert answers is not None
+    assert "cat" in answers["blacklist"]
+    assert "cat" not in load_user_blacklist()
+
+
+def test_wizard_can_remove_tags(scripted: None) -> None:
+    save_user_blacklist({"guro", "cat"})
+    SELECT_ANSWERS[t("tui.blacklist")] = ["remove", "use"]
+    CHECKBOX_ANSWERS[t("tui.blacklist_remove_prompt")] = ["guro"]
+    answers = asyncio.run(wizard.run_wizard())
+
+    assert answers is not None
+    assert "guro" not in load_user_blacklist()
+    assert "cat" in load_user_blacklist()
+
+
+def test_wizard_view_shows_both_lists_and_returns_to_the_step(scripted: None) -> None:
+    save_user_blacklist({"guro"})
+    SELECT_ANSWERS[t("tui.blacklist")] = ["view", "use"]
+    answers = asyncio.run(wizard.run_wizard())
+
+    assert answers is not None
+    # The menu came back after the view, then the default entry was taken.
+    assert [msg for msg in PROMPT_LOG if msg.startswith(t("tui.blacklist"))]
+    assert len([msg for msg in PROMPT_LOG if msg.startswith(t("tui.blacklist"))]) >= 2
+    assert load_user_blacklist() == {"guro"}
 
 
 def test_wizard_asks_every_screen_in_order(scripted: None) -> None:
@@ -117,11 +179,14 @@ def test_wizard_asks_every_screen_in_order(scripted: None) -> None:
         t("tui.order"),
         t("tui.category"),
         t("tui.geometry"),
-        t("tui.blacklist"),
+        t("tui.blacklist"),  # the exclusion menu, whose heading ends in a summary
         t("tui.out"),
         t("tui.confirm"),
     ]
-    assert expected == PROMPT_LOG
+    # The menu heading appends the saved-tag count, so compare by prefix.
+    assert len(expected) == len(PROMPT_LOG)
+    for want, got in zip(expected, PROMPT_LOG, strict=True):
+        assert got.startswith(want), (want, got)
 
 
 def test_wizard_has_no_concurrency_or_options_screen(scripted: None) -> None:

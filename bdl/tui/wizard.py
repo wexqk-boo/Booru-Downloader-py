@@ -11,7 +11,12 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..blacklist import expand_tag, save_blacklist
+from ..blacklist import (
+    BUILTIN_TAGS,
+    expand_tag,
+    load_user_blacklist,
+    save_user_blacklist,
+)
 from ..config import default_concurrency, default_out_dir, env_first, get_setting, set_setting
 from ..filters import AVATAR_ASPECT, WALLPAPER_ASPECT, parse_aspect_range
 from ..i18n import t
@@ -319,27 +324,111 @@ async def _ask_aspect(q: ModuleType, defaults: dict[str, Any]) -> tuple[float, f
     return parse_aspect_range(raw)
 
 
+def _blacklist_summary(saved: set[str]) -> str:
+    """A one-line count for the menu heading, listing a few tags by name."""
+    if not saved:
+        return t("tui.blacklist_none")
+    shown = ", ".join(sorted(saved)[:6])
+    if len(saved) > 6:
+        shown = f"{shown} {t('tui.summary_more', count=len(saved) - 6)}"
+    return f"{t('tui.blacklist_saved', count=len(saved))} — {shown}"
+
+
+def _print_blacklist_sections(user: set[str], builtin: set[str]) -> None:
+    """Show the two lists separately: they are edited by different means."""
+    from rich.console import Console
+
+    console = Console()
+    console.print(f"[bold]{t('tui.blacklist_user_header')}[/]")
+    if user:
+        for tag in sorted(user):
+            console.print(f"  [cyan]{tag}[/]")
+    else:
+        console.print(f"[dim]{t('tui.blacklist_empty_user')}[/]")
+    console.print(f"[bold]{t('tui.blacklist_builtin_header')}[/]")
+    for tag in sorted(builtin):
+        console.print(f"  [dim]{tag}[/]")
+
+
 async def _ask_blacklist(q: ModuleType, defaults: dict[str, Any]) -> set[str] | None:
-    """Exclude tags, typed on a single comma-separated line.
+    """The exclusion step: choose, extend or trim the saved blacklist.
 
-    A root such as ``ai`` expands into its whole family, so the field stays a
-    one-liner while still covering the messy variants. An empty answer means
-    "exclude nothing" and clears whatever was stored before.
+    Four actions, looping until the user settles on a list. The saved list is
+    the default choice every time, so pressing Enter through the wizard keeps
+    whatever was configured before instead of silently clearing it — the step
+    used to write the file on every pass, which made an unrelated re-run wipe
+    the exclusions.
     """
-    raw = await q.text(
-        t("tui.blacklist"),
-        default="",
-        instruction=t("tui.blacklist_hint"),
-        style=style.build_style(),
-    ).ask_async()
-    if raw is None:
-        return None
+    saved = load_user_blacklist()
+    while True:
+        choice = await q.select(
+            t("tui.blacklist") + " — " + _blacklist_summary(saved),
+            choices=[
+                q.Choice(title=t("tui.blacklist_use_saved"), value="use"),
+                q.Choice(title=t("tui.blacklist_add"), value="add"),
+                q.Choice(title=t("tui.blacklist_remove"), value="remove"),
+                q.Choice(title=t("tui.blacklist_view"), value="view"),
+            ],
+            default="use",
+            style=style.build_style(),
+        ).ask_async()
+        if choice is None:
+            return None
 
-    excluded: set[str] = set()
-    for tag in _parse_extra_tags(raw):
-        excluded |= expand_tag(tag)
-    save_blacklist(excluded)
-    return excluded
+        if choice == "use":
+            # Everything to exclude: the saved tags plus the built-in ones.
+            return set(saved) | set(BUILTIN_TAGS)
+
+        if choice == "view":
+            _print_blacklist_sections(saved, set(BUILTIN_TAGS))
+            await q.text(t("tui.blacklist_back"), default="", style=style.build_style()).ask_async()
+            continue
+
+        if choice == "add":
+            raw = await q.text(
+                t("tui.blacklist_add_prompt"),
+                default="",
+                instruction=t("tui.blacklist_add_hint"),
+                style=style.build_style(),
+            ).ask_async()
+            if raw is None:
+                return None
+            typed = _parse_extra_tags(raw)
+            if not typed:
+                continue
+            expanded: set[str] = set()
+            for tag in typed:
+                expanded |= expand_tag(tag)
+            keep = await q.confirm(
+                t("tui.blacklist_persist"), default=True, style=style.build_style()
+            ).ask_async()
+            if keep is None:
+                return None
+            if keep:
+                saved |= expanded
+                save_user_blacklist(saved)
+            else:
+                # A one-run exclusion: returned to the downloader, not stored.
+                return set(saved) | set(BUILTIN_TAGS) | expanded
+            continue
+
+        if choice == "remove":
+            if not saved:
+                continue
+            picked = await q.checkbox(
+                t("tui.blacklist_remove_prompt"),
+                choices=[q.Choice(title=tag, value=tag, checked=False) for tag in sorted(saved)],
+                instruction=t("tui.blacklist_remove_hint"),
+                style=style.build_style(),
+            ).ask_async()
+            if picked is None:
+                return None
+            if not picked:
+                continue
+            for tag in picked:
+                saved -= expand_tag(tag)
+            save_user_blacklist(saved)
+            continue
 
 
 def _describe_geometry(aspect: tuple[float, float] | None) -> str:
