@@ -32,8 +32,8 @@ from rich.text import Text
 from . import USER_AGENT, XBOORU_HEADERS, preview
 from .config import DEFAULT_CONCURRENCY
 from .db import Database
-from .filters import aspect_state
-from .media import SIDECAR_DIR, VIDEO_EXTENSIONS, media_paths, media_subdir, rating_bucket
+from .filters import AI_ART_TAGS, aspect_state, blacklist_hits
+from .media import SIDECAR_DIR, VIDEO_EXTENSIONS, media_kind, media_paths, media_subdir, rating_bucket
 from .meta import ext_for_file_url, filename_for, write_sidecar
 from .models import Post
 from .net.doh import DoHResolver
@@ -557,6 +557,7 @@ class Downloader:
         min_score: int | None = None,
         rating_include: set[str] | None = None,
         blacklist: set[str] | None = None,
+        ai_filter: bool = True,
         aspect_range: tuple[float, float] | None = None,
         aspect_unknown: str = "keep",
         progress: bool = False,
@@ -589,6 +590,10 @@ class Downloader:
         self._min_score = min_score
         self._rating_include = rating_include
         self._blacklist = {tag.lower() for tag in (blacklist or set())}
+        #: Machine-generated art is skipped unless the user opts out. This is
+        #: separate from the personal blacklist so `--no-ai-filter` can lift it
+        #: without also clearing what the user chose to hide.
+        self._ai_filter = ai_filter
         self._aspect_range = aspect_range
         self._aspect_unknown = aspect_unknown
         self._progress_enabled = progress
@@ -672,10 +677,13 @@ class Downloader:
     def passes_filters(self, post: Post) -> bool:
         score_ok = self._min_score is None or (post.score is not None and post.score >= self._min_score)
         rating_ok = self._rating_include is None or post.rating in self._rating_include
-        blacklist_ok = not self._blacklist or not (self._blacklist & {tag.lower() for tag in post.tags})
+        # A pattern may match a component of a longer tag, so `ai` also blocks
+        # `ai_artwork`; see `blacklist_hits`.
+        blacklist_ok = not blacklist_hits(post.tags, self._blacklist)
+        ai_ok = not (self._ai_filter and blacklist_hits(post.tags, AI_ART_TAGS))
         verdict = self.aspect_verdict(post)
         aspect_ok = verdict is True or (verdict is None and self._aspect_unknown == "keep")
-        return score_ok and rating_ok and blacklist_ok and aspect_ok
+        return score_ok and rating_ok and blacklist_ok and ai_ok and aspect_ok
 
     @staticmethod
     def _sha256_of_file(path: Path) -> str:
