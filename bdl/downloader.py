@@ -607,7 +607,7 @@ class Downloader:
         self._phashes: list[tuple[str, str]] | None = None
         self._bar: TransferProgress | None = None
         self._session: aiohttp.ClientSession | None = None
-        self._resolver = DoHResolver()
+        self._resolver = DoHResolver(proxy=self._proxy)
 
     async def open(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -667,7 +667,6 @@ class Downloader:
             if result.exhausted:
                 break
         return posts
-
     def aspect_verdict(self, post: Post) -> bool | None:
         """True/False for the ratio window, None when dimensions are unknown."""
         if self._aspect_range is None:
@@ -784,7 +783,9 @@ class Downloader:
         """Download one post; returns ``(status, error, metadata_row)``."""
         ext = ext_for_file_url(post.file_url) or ".bin"
         filename = filename_for(post, ext)
-        media_dir, sidecar_dir = media_paths(self._out_root, provider.key, post, ext)
+        media_dir, sidecar_dir = media_paths(
+            self._out_root, provider.key, post, ext, kind=media_kind(post, self._aspect_range, ext)
+        )
         final_path = media_dir / filename
         tmp_path = media_dir / f".{filename}.part"
 
@@ -826,6 +827,11 @@ class Downloader:
                         await asyncio.sleep(pause)
                         continue
                     if resp.status == 404:
+                        # Walk the rest of the candidates before giving up: for
+                        # boards that omit the extension it is only a guess.
+                        cand_index += 1
+                        if cand_index < len(candidates):
+                            continue
                         return FAILED, "404 — removed from the board", None
                     if resp.status >= 500:
                         raise _RetryableError(f"HTTP {resp.status}")
@@ -836,6 +842,21 @@ class Downloader:
                         return BLOCKED, f"HTTP {resp.status}", None
                     if resp.status >= 400:
                         return FAILED, f"HTTP {resp.status}", None
+
+                    # The winning candidate settles the extension, which may
+                    # differ from the guess the first URL implied.
+                    chosen_ext = ext_for_file_url(url) or ".bin"
+                    if chosen_ext != ext:
+                        ext = chosen_ext
+                        filename = filename_for(post, ext)
+                        media_dir, sidecar_dir = media_paths(
+                            self._out_root, provider.key, post, ext, kind=media_kind(post, self._aspect_range, ext)
+                        )
+                        final_path = media_dir / filename
+                        tmp_path = media_dir / f".{filename}.part"
+                        media_dir.mkdir(parents=True, exist_ok=True)
+                        if self._sidecar:
+                            sidecar_dir.mkdir(parents=True, exist_ok=True)
 
                     # Trust Content-Length to skip a file we would discard
                     # anyway; the post-transfer check still guards boards that
