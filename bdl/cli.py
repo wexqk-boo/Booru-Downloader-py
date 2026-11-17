@@ -120,6 +120,18 @@ def _add_batch_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checksum", action="store_true", help="verify content sha256 (CPU heavy)")
     parser.add_argument("--min-score", type=int, default=None, help="skip posts scored lower")
     parser.add_argument("--max-size-mb", type=int, default=None, help="skip files larger than this")
+    parser.add_argument(
+        "--no-ai-filter",
+        action="store_true",
+        dest="no_ai_filter",
+        help="keep machine-generated art instead of skipping it",
+    )
+    parser.add_argument(
+        "--no-tag-resolve",
+        action="store_true",
+        dest="no_tag_resolve",
+        help="send tags exactly as typed instead of mapping them per board",
+    )
     parser.add_argument("--timeout", type=float, default=600.0, help="per-file download timeout, seconds")
 
     aspect = parser.add_mutually_exclusive_group()
@@ -508,6 +520,7 @@ async def _execute_batch(args: argparse.Namespace, db: Database) -> tuple[dict[s
             min_score=args.min_score,
             rating_include=rating_set,
             blacklist=blacklist,
+            ai_filter=not args.no_ai_filter,
             aspect_range=aspect_range,
             aspect_unknown=args.aspect_unknown,
             progress=not args.no_progress,
