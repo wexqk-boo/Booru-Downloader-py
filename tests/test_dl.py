@@ -290,26 +290,49 @@ def test_media_paths_buckets(tmp_path) -> None:
     nsfw_video = Post(id="4", source="xbooru", file_url="https://x/4.webm", rating="explicit")
 
     assert media_paths(tmp_path, "xbooru", safe_img, ".png") == (
-        tmp_path / "xbooru" / "safe",
-        tmp_path / "xbooru" / "safe" / "json",
+        tmp_path / "safe",
+        tmp_path / "safe" / "json",
     )
-    assert media_paths(tmp_path, "xbooru", safe_video, ".mp4") == (
-        tmp_path / "xbooru" / "safe" / "videos",
-        tmp_path / "xbooru" / "safe" / "json",
+    # A film goes to the shared videos root, whatever shape it has, and the
+    # kind the caller computed is deliberately ignored.
+    assert media_paths(tmp_path, "xbooru", safe_video, ".mp4", kind="wallpapers") == (
+        tmp_path / "videos" / "safe",
+        tmp_path / "videos" / "safe" / "json",
     )
-    assert media_paths(tmp_path, "xbooru", nsfw_img, ".jpg") == (
-        tmp_path / "xbooru" / "nsfw",
-        tmp_path / "xbooru" / "nsfw" / "json",
+    assert media_paths(tmp_path, "xbooru", nsfw_img, ".jpg", kind="avatars") == (
+        tmp_path / "avatars" / "nsfw",
+        tmp_path / "avatars" / "nsfw" / "json",
+    )
+    assert media_paths(tmp_path, "xbooru", nsfw_video, ".webm", kind="avatars") == (
+        tmp_path / "videos" / "nsfw",
+        tmp_path / "videos" / "nsfw" / "json",
     )
     assert media_paths(tmp_path, "xbooru", nsfw_video, ".webm") == (
-        tmp_path / "xbooru" / "nsfw" / "videos",
-        tmp_path / "xbooru" / "nsfw" / "json",
+        tmp_path / "videos" / "nsfw",
+        tmp_path / "videos" / "nsfw" / "json",
     )
     suggestive = Post(id="5", source="xbooru", file_url="https://x/5.jpg", rating="questionable")
     assert media_paths(tmp_path, "xbooru", suggestive, ".jpg") == (
-        tmp_path / "xbooru" / "suggestive",
-        tmp_path / "xbooru" / "suggestive" / "json",
+        tmp_path / "suggestive",
+        tmp_path / "suggestive" / "json",
     )
+
+
+def test_media_kind_never_calls_a_film_a_wallpaper() -> None:
+    from bdl.downloader import media_kind
+
+    # A 16:9 clip would classify as a wallpaper by ratio alone; it must not.
+    film = Post(id="1", source="x", file_url="https://x/1.mp4", width=1920, height=1080)
+    assert media_kind(film) == ""
+    assert media_kind(film, (1.5, 1.8)) == ""
+
+    # The settled extension wins even when the URL gave nothing away.
+    opaque = Post(id="2", source="x", file_url="https://x/download?id=2")
+    assert media_kind(opaque, (1.5, 1.8), ".webm") == ""
+    assert media_kind(opaque, (1.5, 1.8), ".jpg") == "wallpapers"
+
+    still = Post(id="3", source="x", file_url="https://x/3.jpg", width=1920, height=1080)
+    assert media_kind(still, ext=".jpg") == "wallpapers"
 
 
 def test_fmt_bytes_and_blocks() -> None:
@@ -377,6 +400,8 @@ def test_media_subdir() -> None:
     assert media_subdir(".jpg") == ""
     assert media_subdir(".png") == ""
     assert media_subdir(".jpeg") == ""
+    # `videos` is now a root folder rather than a per-bucket subfolder, but the
+    # marker still answers "is this a film?", which is what the migration asks.
     assert media_subdir(".mp4") == "videos"
     assert media_subdir(".WEBM") == "videos"
     assert media_subdir(".mov") == "videos"
@@ -406,38 +431,216 @@ def test_blacklist_filters_posts() -> None:
     assert not downloader.passes_filters(bad_post)
 
 
-def test_blacklist_file_roundtrip(tmp_path) -> None:
-    from bdl.blacklist import add_tag, load_blacklist, remove_tag, save_blacklist
+def test_blacklist_matches_composites_not_just_exact_tags() -> None:
+    """The bug behind "AI tags slip through": exact intersection misses `ai_*`."""
+    from bdl.downloader import Downloader
 
-    path = tmp_path / "blacklist.txt"
-    assert load_blacklist(path) == set()
+    downloader = Downloader(object(), out_root=Path("/tmp"), blacklist={"ai"})
+    # `ai` alone, and every longer tag that carries it as a component.
+    for tag in ("ai", "ai_artwork", "ai_generated_v2", "some_ai_tag"):
+        post = Post(id="1", source="x", file_url="https://x/1.jpg", tags=(tag,))
+        matches = not downloader.passes_filters(post)
+        # `ai` itself is an exact match; a longer tag counts only when `ai` is a
+        # prefix or suffix component. `some_ai_tag` is a different tag, and
+        # blocking it would be a false hit.
+        expected = tag == "ai" or tag.startswith("ai_")
+        assert matches is expected, tag
+    # A tag that merely contains the letters is untouched.
+    assert downloader.passes_filters(Post(id="2", source="x", file_url="https://x/2.jpg", tags=("airplane",)))
+
+    # Spelling variants collapse to the same canonical tag.
+    dashed = Downloader(object(), out_root=Path("/tmp"), blacklist={"ai-generated"})
+    post = Post(id="3", source="x", file_url="https://x/3.jpg", tags=("ai_generated",))
+    assert not dashed.passes_filters(post)
+
+
+def test_ai_filter_is_on_by_default_and_can_be_lifted() -> None:
+    from bdl.downloader import Downloader
+    from bdl.filters import AI_ART_TAGS
+
+    # The exact tags the user listed, plus the `ai_*` family.
+    for tag in (
+        "stable_diffusion",
+        "novelai",
+        "nai_diffusion",
+        "midjourney",
+        "dall-e",
+        "comfyui",
+        "ai-generated",
+        "ai_generated",
+        "ai_artwork",
+        "generated_by_ai",
+        "ai_assisted",
+    ):
+        assert tag in AI_ART_TAGS, f"{tag} is missing from the built-in AI filter"
+
+    default = Downloader(object(), out_root=Path("/tmp"))
+    post = Post(id="1", source="x", file_url="https://x/1.jpg", tags=("ai_generated",))
+    assert not default.passes_filters(post)
+
+    # An image with no AI tag is unaffected.
+    clean = Post(id="2", source="x", file_url="https://x/2.jpg", tags=("miku", "cat"))
+    assert default.passes_filters(clean)
+
+    lifted = Downloader(object(), out_root=Path("/tmp"), ai_filter=False)
+    assert lifted.passes_filters(post)
+
+    # The opt-out does not silently drop the user's own blacklist.
+    both = Downloader(object(), out_root=Path("/tmp"), blacklist={"scat"}, ai_filter=False)
+    assert not both.passes_filters(Post(id="3", source="x", file_url="https://x/3.jpg", tags=("scat",)))
+
+
+
+def test_blacklist_file_roundtrip(tmp_path) -> None:
+    from bdl.blacklist import (
+        BUILTIN_TAGS,
+        add_tag,
+        load_blacklist,
+        load_user_blacklist,
+        remove_tag,
+        save_blacklist,
+    )
+
+    path = tmp_path / "blacklist.json"
+    # A fresh file holds nothing of the user's — but the built-in list is
+    # always in effect, which is the point of splitting the two.
+    assert load_user_blacklist(path) == set()
+    assert load_blacklist(path) == set(BUILTIN_TAGS)
 
     save_blacklist({"Loli", "guro"}, path)
-    assert load_blacklist(path) == {"loli", "guro"}
+    assert load_user_blacklist(path) == {"loli", "guro"}
+    assert load_blacklist(path) == set(BUILTIN_TAGS) | {"loli", "guro"}
 
     assert add_tag("scat", path) == 1
     assert add_tag("Scat", path) == 0  # already there, same case
-    assert load_blacklist(path) == {"loli", "guro", "scat"}
+    assert load_user_blacklist(path) == {"loli", "guro", "scat"}
 
     assert remove_tag("loli", path) == 1
-    assert load_blacklist(path) == {"guro", "scat"}
+    assert load_user_blacklist(path) == {"guro", "scat"}
     assert remove_tag("nonexistent", path) == 0
 
 
+def test_blacklist_builtins_are_never_written_to_the_user_file(tmp_path) -> None:
+    """Saving a built-in tag must not freeze it in the user's own list."""
+    from bdl.blacklist import BUILTIN_TAGS, load_user_blacklist, save_blacklist
+
+    path = tmp_path / "blacklist.json"
+    save_blacklist({"ai", "midjourney", "guro"}, path)
+
+    assert load_user_blacklist(path) == {"guro"}
+    assert {"ai", "midjourney"} <= BUILTIN_TAGS
+
+
+def test_clear_removes_only_the_users_own_tags(tmp_path) -> None:
+    from bdl.blacklist import BUILTIN_TAGS, clear_user_blacklist, load_blacklist, save_blacklist
+
+    path = tmp_path / "blacklist.json"
+    save_blacklist({"guro", "cat"}, path)
+    assert clear_user_blacklist(path) == 2
+    assert load_blacklist(path) == set(BUILTIN_TAGS)
+
+
+def test_a_legacy_txt_blacklist_is_migrated_once(tmp_path, monkeypatch) -> None:
+    """Nobody should lose their exclusions to the JSON change."""
+    from bdl import blacklist as bl
+
+    config = tmp_path / "config"
+    monkeypatch.setattr(bl, "default_blacklist_path", lambda: config / "bdl" / "blacklist.json")
+    monkeypatch.setattr(bl, "legacy_blacklist_path", lambda: config / "bdl" / "blacklist.txt")
+    (config / "bdl").mkdir(parents=True)
+    (config / "bdl" / "blacklist.txt").write_text("# a comment\nguro\ncat\n", encoding="utf-8")
+
+    assert bl.load_user_blacklist() == {"guro", "cat"}
+    assert (config / "bdl" / "blacklist.json").is_file()
+
+
+def test_writing_the_blacklist_is_atomic(tmp_path) -> None:
+    """A crash mid-write must not leave a partial list behind."""
+    from bdl.blacklist import load_user_blacklist, save_user_blacklist
+
+    path = tmp_path / "blacklist.json"
+    save_user_blacklist({"guro"}, path)
+    save_user_blacklist({"cat"}, path)
+
+    assert load_user_blacklist(path) == {"cat"}
+    # The temporary file used for the swap is gone, not left beside the list.
+    leftovers = [entry.name for entry in tmp_path.iterdir() if entry.name != "blacklist.json"]
+    assert leftovers == []
+
+
 def test_blacklist_family_expansion(tmp_path) -> None:
-    from bdl.blacklist import add_tag, load_blacklist, remove_tag
+    from bdl.blacklist import BUILTIN_TAGS, add_tag, load_blacklist, load_user_blacklist, remove_tag
 
-    path = tmp_path / "bl-family.txt"
+    path = tmp_path / "bl-family.json"
 
+    # The generator tags are built in: adding the family leaves them out of the
+    # user's file, yet they are still excluded because load_blacklist unions
+    # the two lists.
     added = add_tag("ai", path)
-    tags = load_blacklist(path)
-    assert added >= 5
-    assert "ai_generated" in tags
-    assert "midjourney" in tags
+    assert added == 2  # only machine_learning and neural_network are not built in
+    assert "ai_generated" in load_blacklist(path)
+    assert "midjourney" in load_blacklist(path)
+    assert "ai_generated" not in load_user_blacklist(path)
+    assert load_user_blacklist(path) == {"machine_learning", "neural_network"}
+    assert remove_tag("ai", path) == added
 
-    removed = remove_tag("ai", path)
+    # A user tag that is not built in still expands into its family.
+    added = add_tag("cat", path)
+    assert added >= 1
+    assert {"cat", "cat_ears"} <= load_user_blacklist(path)
+
+    removed = remove_tag("cat", path)
     assert removed == added
-    assert load_blacklist(path) == set()
+    assert load_user_blacklist(path) == set()
+    assert load_blacklist(path) == set(BUILTIN_TAGS)
+
+
+def test_blacklist_cli_commands(tmp_path, monkeypatch, capsys) -> None:
+    """`bdl blacklist list|add|remove|clear` against a throwaway config."""
+    from bdl import blacklist as bl
+    from bdl.cli import build_parser
+
+    config = tmp_path / "config"
+    monkeypatch.setattr(bl, "default_blacklist_path", lambda: config / "bdl" / "blacklist.json")
+    monkeypatch.setattr(bl, "legacy_blacklist_path", lambda: config / "bdl" / "blacklist.txt")
+
+    async def run(argv: list[str]) -> int:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        return await args.func(args)
+
+    def line() -> str:
+        return capsys.readouterr().out
+
+    # add several tags, then repeat one
+    assert asyncio.run(run(["blacklist", "add", "cat", "guro"])) == 0
+    assert "cat" in line()
+    assert asyncio.run(run(["blacklist", "add", "cat"])) == 0
+    assert "nothing new" in line()
+
+    # list shows the two lists separately
+    assert asyncio.run(run(["blacklist", "list"])) == 0
+    out = line()
+    assert "Saved tags" in out and "Built-in tags" in out
+    assert "cat" in out and "guro" in out
+    assert "ai_generated" in out  # a built-in tag
+
+    # remove takes a tag and its family
+    assert asyncio.run(run(["blacklist", "remove", "cat"])) == 0
+    assert "cat" in line()
+    assert "cat" not in bl.load_user_blacklist()
+    assert "guro" in bl.load_user_blacklist()
+
+    # clear empties only the user's list
+    assert asyncio.run(run(["blacklist", "clear"])) == 0
+    assert "cleared" in line()
+    assert bl.load_user_blacklist() == set()
+    assert bl.load_blacklist() == set(bl.BUILTIN_TAGS)
+    assert asyncio.run(run(["blacklist", "clear"])) == 0
+    assert "already empty" in line()
+
+    # a missing operand is a usage error
+    assert asyncio.run(run(["blacklist", "add"])) == 2
 
 
 def test_family_preview_lists_members() -> None:
@@ -1548,7 +1751,13 @@ def test_moebooru_popular_endpoint_is_the_bare_top() -> None:
 
 
 def test_bare_top_uses_the_popular_listing_only_without_tags() -> None:
-    """The listing takes no tags and ignores paging, so it fits page 1 only."""
+    """The listing takes no tags and ignores paging, so it fits page 1 only.
+
+    A tagless request still gets the board's own weekly page. A tagged one is
+    answered by a real search first, because the tag is what the user asked to
+    filter on; only when that search comes back empty does the weekly listing
+    step in (covered separately).
+    """
     from bdl.providers.client import ProviderClient
 
     urls: list[str] = []
@@ -1577,6 +1786,108 @@ def test_bare_top_uses_the_popular_listing_only_without_tags() -> None:
     assert "order%3Ascore" in urls[1]
     assert "popular_recent" not in urls[2]  # page 2 needs the real search
     assert "order%3Ascore" in urls[2]
+
+
+def test_a_tag_the_board_does_not_serve_still_gets_the_weekly_listing() -> None:
+    """`1girl` is a danbooru-ism: a Moebooru board searches it to zero posts.
+
+    Reporting found=0 for the week's best work is exactly what this changes:
+    the tagged search is tried first, and the board's own listing answers when
+    the tag turns out to be one the board does not serve.
+    """
+    from bdl.providers.client import ProviderClient
+
+    urls: list[str] = []
+    calls = {"n": 0}
+
+    class _Settings:
+        cache_ttl = 0.0
+        max_cache_entries = 8
+
+        def credentials_for(self, key: str) -> dict[str, str]:
+            return {}
+
+    class _Client(ProviderClient):
+        async def _fetch_json(self, url: str, provider) -> object:  # type: ignore[override]
+            urls.append(url)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return []  # the board serves no post tagged "1girl"
+            return [
+                {
+                    "id": 7,
+                    "tags": "long_hair original",
+                    "file_url": "/image/a.png",
+                    "width": 100,
+                    "height": 100,
+                    "score": 42,
+                }
+            ]
+
+    async def scenario() -> list[int]:
+        client = _Client(_Settings())  # type: ignore[arg-type]
+        result = await client.search_provider(PROVIDERS["konachan"], "konachan", "1girl", 1, 10, "top")
+        return [post.score for post in result.posts]
+
+    assert asyncio.run(scenario()) == [42]
+    assert "order%3Ascore" in urls[0]  # the tagged search goes first
+    assert urls[1].startswith("https://konachan.com/post/popular_recent.json")  # then the listing
+
+
+def test_a_newest_search_is_never_quietly_served_the_weekly_listing() -> None:
+    """Only the `top` ordering may fall back; `newest` must stay honest."""
+    from bdl.providers.client import ProviderClient
+
+    urls: list[str] = []
+
+    class _Settings:
+        cache_ttl = 0.0
+        max_cache_entries = 8
+
+        def credentials_for(self, key: str) -> dict[str, str]:
+            return {}
+
+    class _Client(ProviderClient):
+        async def _fetch_json(self, url: str, provider) -> object:  # type: ignore[override]
+            urls.append(url)
+            return []
+
+    async def scenario() -> int:
+        client = _Client(_Settings())  # type: ignore[arg-type]
+        result = await client.search_provider(PROVIDERS["konachan"], "konachan", "1girl", 1, 10, "")
+        return len(result.posts)
+
+    assert asyncio.run(scenario()) == 0
+    assert len(urls) == 1
+    assert "popular_recent" not in urls[0]
+
+
+def test_a_deep_page_is_not_answered_by_the_unpageable_listing() -> None:
+    """Every page but the first must stay a real, pageable search."""
+    from bdl.providers.client import ProviderClient
+
+    urls: list[str] = []
+
+    class _Settings:
+        cache_ttl = 0.0
+        max_cache_entries = 8
+
+        def credentials_for(self, key: str) -> dict[str, str]:
+            return {}
+
+    class _Client(ProviderClient):
+        async def _fetch_json(self, url: str, provider) -> object:  # type: ignore[override]
+            urls.append(url)
+            return []
+
+    async def scenario() -> int:
+        client = _Client(_Settings())  # type: ignore[arg-type]
+        result = await client.search_provider(PROVIDERS["konachan"], "konachan", "1girl", 3, 10, "top")
+        return len(result.posts)
+
+    assert asyncio.run(scenario()) == 0
+    assert len(urls) == 1
+    assert "popular_recent" not in urls[0]
 
 
 def test_missing_result_from_the_popular_listing_falls_back() -> None:

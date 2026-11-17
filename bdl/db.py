@@ -305,6 +305,30 @@ class Database:
         rows = await self._fetchall("SELECT uid FROM downloads")
         return {row[0] for row in rows}
 
+    async def recorded_paths(self) -> list[tuple[str, str]]:
+        """``(uid, file_path)`` for every recorded download.
+
+        The layout migration rewrites these paths after moving the files, so it
+        needs them all up front rather than one query per move.
+        """
+        rows = await self._fetchall("SELECT uid, file_path FROM downloads")
+        return [(uid, path or "") for uid, path in rows]
+
+    async def update_paths(self, updates: list[tuple[str, str]]) -> int:
+        """Point recorded rows at their new files.
+
+        ``updates`` is a list of ``(uid, new_path)`` pairs; the SQL takes the
+        path first, so the tuple is reordered here rather than at the call site.
+        """
+        if not updates:
+            return 0
+        await self.conn.executemany(
+            "UPDATE downloads SET file_path = ? WHERE uid = ?",
+            [(path, uid) for uid, path in updates],
+        )
+        await self.conn.commit()
+        return len(updates)
+
     async def prune_stale(self, dry_run: bool = False, under: Path | None = None) -> dict[str, int]:
         """Drop records whose files are gone from disk.
 
