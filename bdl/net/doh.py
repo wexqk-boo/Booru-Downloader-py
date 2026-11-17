@@ -22,20 +22,58 @@ LOG = logging.getLogger(__name__)
 
 DOH_URL = "https://cloudflare-dns.com/dns-query"
 CACHE_TTL = 300.0
+#: A resolver that answers is worth 8 s of patience; one that is blackholed is
+#: not, because the answer is the same and every host waits for it.
+QUERY_TIMEOUT = 5.0
+#: After this many failures in a row the resolver stops asking for a while.
+#: A filtered network drops DoH packets rather than refusing them, so without
+#: this every hostname in a 12-source run pays the full timeout, one after
+#: another, and the run looks like "the timeouts fire too early".
+FAILURE_THRESHOLD = 3
+COOLDOWN = 120.0
 
 
 class DoHResolver(AbstractResolver):
     """Cloudflare DoH resolver with a cache and a fallback to system DNS."""
 
-    def __init__(self, doh_url: str = DOH_URL) -> None:
+    def __init__(self, doh_url: str = DOH_URL, proxy: str | None = None) -> None:
         self._doh_url = doh_url
+        #: Honour ``PROXY_URL`` here too: when the boards are only reachable
+        #: through a proxy, cloudflare-dns.com usually is as well, and asking
+        #: for it directly just burns the timeout before every single resolve.
+        self._proxy = proxy or None
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
+        #: Consecutive DoH failures and the time we may ask again. Guarded by
+        #: the event loop only: every reader runs on the same loop.
+        self._failures = 0
+        self._retry_at = 0.0
+
+    def _in_cooldown(self) -> bool:
+        return self._failures >= FAILURE_THRESHOLD and time.monotonic() < self._retry_at
+
+    def _note_result(self, ok: bool) -> None:
+        if ok:
+            self._failures = 0
+            return
+        self._failures += 1
+        if self._failures == FAILURE_THRESHOLD:
+            self._retry_at = time.monotonic() + COOLDOWN
+            LOG.warning(
+                "DoH failed %d times in a row; skipping it for %.0f s and using system DNS",
+                self._failures,
+                COOLDOWN,
+            )
+        elif self._failures > FAILURE_THRESHOLD:
+            self._retry_at = time.monotonic() + COOLDOWN
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8))
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=QUERY_TIMEOUT),
+                proxy=self._proxy,
+            )
         return self._session
 
     async def resolve(self, host: str, port: int = 0, family: int = 0) -> list[dict[str, Any]]:
@@ -48,7 +86,7 @@ class DoHResolver(AbstractResolver):
             if cached and cached[0] > time.monotonic():
                 return self._adapt(cached[1], host, port, family)
 
-            addresses = await self._query(host)
+            addresses = [] if self._in_cooldown() else await self._query(host)
             if not addresses:
                 LOG.info("DoH has no record for %s, falling back to system DNS", host)
                 addresses = await self._system(host)
@@ -69,12 +107,15 @@ class DoHResolver(AbstractResolver):
             async with session.get(self._doh_url, params=params, headers=headers) as response:
                 if response.status != 200:
                     LOG.warning("DoH returned HTTP %s", response.status)
+                    self._note_result(False)
                     return []
                 data = json.loads(await response.text())
         except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError) as exc:
             LOG.warning("DoH is unavailable: %s", exc)
+            self._note_result(False)
             return []
 
+        self._note_result(True)
         return [answer["data"] for answer in data.get("Answer", []) if answer.get("type") == 1 and answer.get("data")]
 
     @staticmethod
@@ -98,6 +139,8 @@ class DoHResolver(AbstractResolver):
 
     async def close(self) -> None:
         self._cache.clear()
+        self._failures = 0
+        self._retry_at = 0.0
         if self._session is not None and not self._session.closed:
             await self._session.close()
             self._session = None
