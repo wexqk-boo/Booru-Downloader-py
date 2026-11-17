@@ -44,6 +44,7 @@ from .models import Post
 from .notifier import notify
 from .providers import ALL, PROVIDERS, CliProviderClient, ProviderError, resolve_sources
 from .stdio import restore_blocking
+from .tags.resolver import Resolution
 
 LOG = logging.getLogger("bdl")
 SOURCE_CHOICES = [*sorted(PROVIDERS), ALL]
@@ -520,6 +521,34 @@ async def _execute_batch(args: argparse.Namespace, db: Database) -> tuple[dict[s
     all_sources_failed = False
     failed_providers: list[str] = []
 
+    # Every board spells the same idea differently — 1girl is dead on Moebooru
+    # and Solo on Zerochan — so the typed tags are resolved per source before a
+    # single query goes out. A tag a board does not have is reported, never
+    # silently searched for (which is what produced found=0).
+    resolutions: dict[str, Resolution] = {}
+    if not getattr(args, "no_tag_resolve", False) and args.tags:
+        try:
+            from .tags.resolver import TagCache, resolve_for_providers
+
+            resolutions = await resolve_for_providers(
+                [provider.key for provider in providers],
+                args.tags,
+                settings=shim,
+                cache=TagCache(default_db_path()),
+            )
+        # Resolution is an aid, never a gate: a board whose tag API is down
+        # must still be searched with the tags as typed.
+        except Exception as exc:
+            LOG.warning("tag resolution unavailable: %s", exc)
+            resolutions = {}
+
+    for provider in providers:
+        provider_tags = resolutions.get(provider.key)
+        if provider_tags and provider_tags.summary_lines():
+            LOG.info("tag mapping for %s:", provider.key)
+            for line in provider_tags.summary_lines():
+                LOG.info("%s", line)
+
     async with (
         CliProviderClient(shim, max_concurrency=4) as client,
         Downloader(
@@ -544,12 +573,18 @@ async def _execute_batch(args: argparse.Namespace, db: Database) -> tuple[dict[s
         ) as downloader,
     ):
         for provider in providers:
-            run_id = await db.start_run(provider.key, args.tags)
+            provider_tags = resolutions.get(provider.key)
+            # A board that knows none of the typed tags is still searched with
+            # them: on a Moebooru board the "top" ordering then answers from the
+            # board's own weekly listing. The mapping is reported either way, so
+            # an empty batch is never a silent mystery.
+            tags = provider_tags.tags if provider_tags and provider_tags.tags else args.tags
+            run_id = await db.start_run(provider.key, tags)
             try:
                 stats = await downloader.run_batch(
                     client,
                     provider,
-                    args.tags,
+                    tags,
                     limit=args.limit,
                     per_page=args.per_page,
                     order=args.order,
