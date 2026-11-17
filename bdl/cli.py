@@ -15,7 +15,12 @@ from pathlib import Path
 import aiohttp
 
 from . import __version__
-from .blacklist import add_tag, load_blacklist, remove_tag
+from .blacklist import (
+    add_tags,
+    clear_user_blacklist,
+    load_blacklist,
+    remove_tags,
+)
 from .config import (
     DEFAULT_CONCURRENCY,
     TURBO_CONCURRENCY,
@@ -162,7 +167,7 @@ def _add_batch_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--blacklist",
         default=None,
-        help="extra tags to exclude, comma separated (on top of ~/.config/bdl/blacklist.txt)",
+        help="extra tags to exclude, comma separated (on top of ~/.config/bdl/blacklist.json)",
     )
 
     category = parser.add_mutually_exclusive_group()
@@ -268,8 +273,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="manage excluded tags",
         conflict_handler="resolve",
     )
-    sp.add_argument("action", choices=["list", "add", "remove"], help="list, or add/remove <tag>")
-    sp.add_argument("tag", nargs="?", default=None, help="tag for add/remove")
+    sp.add_argument(
+        "action",
+        choices=["list", "add", "remove", "clear"],
+        help="list, add <tags...>, remove <tags...>, or clear the saved tags",
+    )
+    sp.add_argument(
+        "tags",
+        nargs="*",
+        default=[],
+        metavar="tag",
+        help="one or more tags (add/remove); `clear` takes none",
+    )
     sp.set_defaults(func=cmd_blacklist)
 
     sp = sub.add_parser(
@@ -713,25 +728,51 @@ async def cmd_status(args: argparse.Namespace) -> int:
 
 
 async def cmd_blacklist(args: argparse.Namespace) -> int:
-    tags = load_blacklist()
+    """Show or edit the exclusions.
+
+    The saved list and the built-in list are kept apart everywhere: ``list``
+    shows both under their own heading, ``clear`` empties only the saved one,
+    and nothing here can touch the built-in tags.
+    """
+    from .blacklist import default_blacklist_path, split_blacklist
+
     if args.action == "list":
-        if not tags:
-            print("Blacklist is empty (file: ~/.config/bdl/blacklist.txt)")
-            return 0
-        _print_blacklist(tags)
+        user_tags, builtin_tags = split_blacklist(load_blacklist())
+        print(f"== Saved tags ({len(user_tags)}) ==")
+        if user_tags:
+            _print_blacklist(user_tags)
+        else:
+            print(f"  none — add some with `bdl blacklist add <tag>` ({default_blacklist_path()})")
+        print()
+        print(f"== Built-in tags ({len(builtin_tags)}) ==")
+        _print_blacklist(builtin_tags)
         return 0
 
-    if not args.tag:
-        print("Usage: bdl blacklist add|remove <tag>", file=sys.stderr)
+    if args.action == "clear":
+        removed = clear_user_blacklist()
+        if removed:
+            print(f"cleared {removed} saved tag(s); the built-in ones stay in place")
+        else:
+            print("the saved blacklist was already empty")
+        return 0
+
+    if not args.tags:
+        print(f"Usage: bdl blacklist {args.action} <tag> [<tag> ...]", file=sys.stderr)
         return 2
 
-    tag = args.tag.strip().lower()
     if args.action == "add":
-        changed = add_tag(args.tag)
-        print(f"added {changed} tags for {tag!r}" if changed else f"{tag!r} is already blacklisted")
+        changed, added = add_tags(list(args.tags))
+        if changed:
+            print(f"added {changed} tag(s): {', '.join(added)}")
+        else:
+            print("nothing new — every tag was already blacklisted")
+        return 0
+
+    changed, removed = remove_tags(list(args.tags))
+    if changed:
+        print(f"removed the family of {', '.join(removed)}")
     else:
-        changed = remove_tag(args.tag)
-        print(f"removed {changed} tags for {tag!r}" if changed else f"{tag!r} was not blacklisted")
+        print("nothing removed — those tags were not in the saved blacklist")
     return 0
 
 
