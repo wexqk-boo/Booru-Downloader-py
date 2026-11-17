@@ -11,18 +11,37 @@ from .library import TAGS_CATALOG
 
 TAG_FAMILIES: dict[str, tuple[str, ...]] = {
     "ai": (
+        # The spellings bdl writes itself and the ones boards actually use.
         "ai_generated",
         "ai-generated",
         "ai_art",
+        "ai_artwork",
+        "ai-artwork",
         "ai_assisted",
+        "ai_generated_tag",
+        "generated_by_ai",
+        "generated_with_ai",
+        # Generators, by the name their users tag with.
         "stable_diffusion",
         "stable-diffusion",
-        "midjourney",
+        "stable_diffusion_xl",
         "novelai",
-        "artificial_intelligence",
-        "neural_network",
+        "novel_ai",
+        "nai_diffusion",
+        "nai-diffusion",
+        "midjourney",
         "dall-e",
         "dalle",
+        "comfyui",
+        "comfy_ui",
+        "automatic1111",
+        "a1111",
+        "invokeai",
+        "sdwebui",
+        "pony_diffusion",
+        # The older, vaguer wording that still turns up.
+        "artificial_intelligence",
+        "neural_network",
         "machine_learning",
     ),
     "furry": (

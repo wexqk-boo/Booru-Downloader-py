@@ -23,6 +23,50 @@ _CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
 # purpose: this runs on every query and is not meant to be a taste filter.
 FILTERED_TAGS: frozenset[str] = frozenset({"scat", "necrophilia", "bestiality", "snuff"})
 
+#: Tags for machine-generated art, excluded from every download unless the user
+#: turns it off. The boards only apply some of them inconsistently; xbooru and
+#: gelbooru in particular let a generator's own tag through on plenty of posts,
+#: so the check lives here rather than in a query the board may ignore.
+#: Both spellings of a hyphenated tag are listed because the set doubles as the
+#: authoritative list of what counts as AI art; matching canonicalises anyway
+#: (see :func:`blacklist_hits`), so ``ai-generated`` and ``ai_generated`` are
+#: one pattern, and a plain ``ai`` also catches ``ai_artwork`` and
+#: ``ai_generated_v2``.
+AI_ART_TAGS: frozenset[str] = frozenset(
+    {
+        "ai",
+        "ai_art",
+        "ai_artwork",
+        "ai-artwork",
+        "ai_assisted",
+        "ai_generated",
+        "ai-generated",
+        "ai_generated_tag",
+        "artificial_intelligence",
+        "generated_by_ai",
+        "generated_with_ai",
+        # Generators and the tools they are run from.
+        "stable_diffusion",
+        "stable-diffusion",
+        "stable_diffusion_xl",
+        "novelai",
+        "novel_ai",
+        "nai_diffusion",
+        "nai-diffusion",
+        "midjourney",
+        "dall_e",
+        "dall-e",
+        "dalle",
+        "comfyui",
+        "comfy_ui",
+        "automatic1111",
+        "a1111",
+        "invokeai",
+        "sdwebui",
+        "pony_diffusion",
+    }
+)
+
 # Sample the middle of the "portrait" range: 2:3 is 0.667, 3:4 is 0.75, and we
 # allow a little slack past square so near-1:1 crops still count as avatars.
 WALLPAPER_ASPECT: tuple[float, float] = (1.5, 1.8)
@@ -48,6 +92,21 @@ def tag_hits(tag: str, patterns: frozenset[str]) -> bool:
     if tag in patterns:
         return True
     return any(tag.startswith(pattern + "_") or tag.endswith("_" + pattern) for pattern in patterns)
+
+
+def blacklist_hits(tags: tuple[str, ...] | list[str], patterns: frozenset[str]) -> bool:
+    """True when any of *tags* matches any blacklist *pattern*.
+
+    Comparison happens on canonical forms, so ``ai-generated`` and
+    ``ai_generated`` are the same tag, and a pattern also matches as a
+    *component* of a longer tag — blacklisting ``ai`` catches ``ai_artwork``
+    instead of only the literal tag ``ai``. Plain set intersection used to miss
+    every composite, which is exactly how generator tags slipped through.
+    """
+    if not patterns:
+        return False
+    canonical_patterns = frozenset(canonical(pattern) for pattern in patterns)
+    return any(tag_hits(canonical(tag), canonical_patterns) for tag in tags)
 
 
 def aspect_ratio(post: Post) -> float | None:
